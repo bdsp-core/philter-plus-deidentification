@@ -17,6 +17,7 @@ Flags:
 -o (output_dir):  Path to the directory to save PHI-reduced notes
 -l (True,False):  When this is true, the pipeline prints and saves log in a subdirectory in each output directory, the default is True
 
-7) If you see any PHI not being removed please contact Aditya immediately so that he can make the necessary changes at agupta41@mgh.harvard.edu.
-8) Always deidentify a small batch of files to check if you are getting the correct output and all the PHI keywords are being removed correctly.
-9) For more information please refer to this link: https://github.com/BCHSI/philter-deidstable1_mirror
+7) After the program finishes you can find the deidentified notes in the data/output folder.
+8) If you see any PHI not being removed please contact Aditya immediately so that he can make the necessary changes at agupta41@mgh.harvard.edu.
+9) Always deidentify a small batch of files to check if you are getting the correct output and all the PHI keywords are being removed correctly.
+10) For more information please refer to this link: https://github.com/BCHSI/philter-deidstable1_mirror
