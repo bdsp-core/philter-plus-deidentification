@@ -6,11 +6,11 @@ Please follow these steps to run the code:
 1) Create a conda environment with Python 3.10. 
 2) Install all the packages listed in the requirements.txt using pip install -r requirements.txt in the conda environment.
 3) You might need to install two additional nltk packages separately. Please make sure that packages are installed before you start the deidentification process. You can do that using these commands:
-   '''
+   ```
    import nltk
    nltk.download('punkt')
    nltk.download('averaged_perceptron_tagger')
-   '''
+   ```
 4) After you have the environment set up correctly please make sure you have the notes that you need to deidentify in .txt format and place it in the input folder. 
 5) The deidentified output file will have the same name as the input file so make sure that you do not have any PHI in the name of the file.
 6) For the purpose of this code we are using data/input as the input directory to store all the identified notes which need to be deidentified.
