@@ -19,10 +19,11 @@ Please follow these steps to run the code:
 python deidpipe.py -i data/input/ -o data/output/ -f configs/philter_one.json -l False
 
 Flags:
+```
 -i (input_dir):  Path to the directory or the file that contains the PHI note
 -o (output_dir):  Path to the directory to save PHI-reduced notes
 -l (True,False):  When this is true, the pipeline prints and saves log in a subdirectory in each output directory, the default is True
-
+```
 8) After the program finishes you can find the deidentified notes in the data/output folder.
 9) If you see any PHI not being removed please contact Aditya immediately so that he can make the necessary changes at agupta41@mgh.harvard.edu.
 10) Always deidentify a small batch of files to check if you are getting the correct output and all the PHI keywords are being removed correctly.
