@@ -14,7 +14,7 @@ def remove_keywords(text):
         "Brigham and Womens Hospital",
         "Brigham and Women's Hosptial",
         "Brigham and Women's Faulkner Hospital",
-        "Brigham And Womens Primary Care"
+        "Brigham And Womens Primary Care",
         "Mass(achusetts)? General Hospital",
         "Massachusetts General Hospital",
         "Massachusetts General",
@@ -37,7 +37,7 @@ def remove_keywords(text):
         "Newton-Wellesley Hospital",
         "Newton Wellesley Hospital",
         "NWH",
-        "Union Hospital"
+        "Union Hospital",
         "McLean Hospital",
         "Cooley Dickinson Hospital",
         "Cooley Dickinson",
@@ -119,7 +119,9 @@ def remove_keywords(text):
         "mr#",
         "MRN",
         "SHAPIRO CLINICAL CENTER",
-        "UMASS BOSTON"
+        "UMASS BOSTON",
+        "Puya",
+        "Yvo"
     ]]
 
     for keyword in keywords:
