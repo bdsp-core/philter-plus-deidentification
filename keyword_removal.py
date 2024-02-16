@@ -26,6 +26,7 @@ def remove_keywords(text):
         "South Shore Hospital",
         "A Teaching Affiliate of Harvard Medical School",
         "Harvard Medical School",
+        "HMS",
         "Partners Neurology Resident",
         "Partners Compliance",
         "MGH",
