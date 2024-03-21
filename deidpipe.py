@@ -2,11 +2,14 @@
 import sys
 import argparse
 import distutils.util
+import pymongo
 from pymongo import MongoClient
 from phitexts import Phitexts
 from datetime import date
 import os
 import json
+
+print(sys.executable)
 
 # TODO: replace this by Python's POSIX complaint versions
 EXIT_SUCCESS = 0
@@ -67,8 +70,6 @@ def get_args():
                     type=str)
     return ap.parse_args()
 
-
-
 def read_mongo_config(mongofile):
     if not os.path.exists(mongofile):
        raise Exception("Filepath does not exist", mongofile)
@@ -111,21 +112,25 @@ def main():
 def main_mongo(args, db=None ,mongo=None):  
     # initializes texts container
     # db none then pass input dir if not don't pass input dir 
+    
     batch = 0
     if args.batch is not None:
        batch = int(float(args.batch))
+    
     phitexts = Phitexts(args.input,args.xml,batch,db,mongo)
+    
     # detect PHI coordinates
     if __debug__: print("detecting PHI coordinates")
+    
     if args.xml:
        if __debug__: print("Generating coordinate map from xml")
        phitexts.detect_xml_phi()       
     elif args.dynamic_blacklist:
-
        phitexts.detect_phi(args.filters, args.dynamic_blacklist,
                             verbose=args.verbose)
     else:
        phitexts.detect_phi(args.filters, verbose=args.verbose)
+    
     if phitexts.coords:
         if not args.xml:
             # detects PHI types
