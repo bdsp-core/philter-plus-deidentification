@@ -11,20 +11,18 @@ Please follow these steps to run the code:
    nltk.download('punkt')
    nltk.download('averaged_perceptron_tagger')
    ```
-4) After you have the environment set up correctly please make sure you have the notes that you need to deidentify in .txt format and place it in the input folder. 
-5) The deidentified output file will have the same name as the input file so make sure that you do not have any PHI in the name of the file.
-6) For the purpose of this code we are using data/input as the input directory to store all the identified notes which need to be deidentified.
-7) Please run the following command to deidentify your notes: 
+4) Please add all the site specific keywords in the philter-plus-deidentification/keyword_removal.py in the format in which other keywords have been added. Please have a look at the file for reference. Please do not proceed until this step is complete.  
+5) After you have the environment set up correctly please make sure you have the notes that you need to deidentify in .txt format and place it in the /data/waitingRoom/ folder. 
+6) The deidentified output file will have the same name as the input file so make sure that you do not have any PHI in the name of the file.
+7) For the purpose of this code we are using data/waitingRoom as the input directory to store all the identified notes which need to be deidentified.
+8) Please deidentify only a small set of notes first to ensure that all the site specific keywords are being removed. If they are not being removed then please go back to step 4.
+9) Please run the following command to deidentify your notes: 
 
-python deidpipe.py -i data/input/ -o data/output/ -f configs/philter_one.json -l False
+python parallel_process.py
 
-Flags:
-```
--i (input_dir):  Path to the directory or the file that contains the PHI note
--o (output_dir):  Path to the directory to save PHI-reduced notes
--l (True,False):  When this is true, the pipeline prints and saves log in a subdirectory in each output directory, the default is True
-```
-8) After the program finishes you can find the deidentified notes in the data/output folder.
-9) If you see any PHI not being removed please contact Aditya immediately so that he can make the necessary changes at agupta41@mgh.harvard.edu.
-10) Always deidentify a small batch of files to check if you are getting the correct output and all the PHI keywords are being removed correctly.
-11) For more information please refer to this link: https://github.com/BCHSI/philter-deidstable1_mirror
+10) After the program finishes you can find the deidentified notes in the /data/output/ folder.
+11) You can remove all the files from the /data/doneFolder/ after the deidentification is complete.
+12) If you have a large number of files that need to be deidentiified please make sure that computer has enough computing power or try to run the program in smaller batches. The batch size will depend on the computing power of your machine.  
+13) If you see any PHI not being removed please contact Aditya immediately so that he can make the necessary changes at agupta41@mgh.harvard.edu.
+14) Always deidentify a small batch of files to check if you are getting the correct output and all the PHI keywords are being removed correctly.
+15) For more information please refer to this link: https://github.com/BCHSI/philter-deidstable1_mirror
