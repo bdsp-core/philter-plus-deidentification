@@ -1,1 +1,1 @@
-\b((?<=(?i)call: )|(?<=(?i)phone: )|(?<=(?i)telephone\snumber\sis\s))\d+[\-\s]\d+([\-\s]\d+)?\b
+(?i)\b((?<=call: )|(?<=phone: )|(?<=telephone\snumber\sis\s))\d+[\-\s]\d+([\-\s]\d+)?\b
