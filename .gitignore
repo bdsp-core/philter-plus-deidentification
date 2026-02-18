@@ -1,0 +1,17 @@
+# AWS SSH keys - never commit
+*.pem
+
+# Generated user-data scripts
+user-data.sh
+test-user-data.sh
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test output files
+test_output_*.txt
+
+# Claude internal
+.claude/
