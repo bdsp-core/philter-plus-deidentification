@@ -31,7 +31,7 @@ KEY_NAME="bdsp-ec2"               # EC2 key pair name
 KEY_FILE="./bdsp-ec2.pem"         # PEM file saved locally (same folder as this script)
 VPC_ID="vpc-0b19ba4d16f0f4695"          # bdsp-webapp-vpc
 SUBNET_ID="subnet-032f4ed8e15acf550"    # bdsp-webapp-subnet-public1-us-east-1a
-SG_IDS_COMMA="sg-0f0200d3a98d50585"    # launch-wizard-17
+SG_IDS_COMMA="sg-0350d41bfbbc1f0b6"    # launch-wizard-20
 
 # ============================================================================
 # SETUP
@@ -193,20 +193,21 @@ echo ""
 echo "Step 4: Configuring AWS credentials for instances..."
 echo "⚠ Using bidmc user credentials (not creating IAM roles)"
 
-# Get AWS credentials from the bidmc profile
-AWS_ACCESS_KEY=$(aws configure get aws_access_key_id --profile $AWS_PROFILE)
-AWS_SECRET_KEY=$(aws configure get aws_secret_access_key --profile $AWS_PROFILE)
+# Get AWS credentials from the bidmc profile (reads directly from ~/.aws/credentials)
+AWS_ACCESS_KEY=$(aws configure get aws_access_key_id --profile $AWS_PROFILE 2>/dev/null) || true
+AWS_SECRET_KEY=$(aws configure get aws_secret_access_key --profile $AWS_PROFILE 2>/dev/null) || true
+AWS_SESSION_TOKEN=$(aws configure get aws_session_token --profile $AWS_PROFILE 2>/dev/null) || true
 
 if [ -z "$AWS_ACCESS_KEY" ] || [ -z "$AWS_SECRET_KEY" ]; then
     echo "✗ Could not retrieve credentials from bidmc profile"
-    echo "  Make sure you have configured: aws configure --profile bidmc"
+    echo "  Make sure ~/.aws/credentials has a [bidmc] section with valid keys"
     exit 1
 fi
 
 echo "✓ Retrieved credentials from bidmc profile"
 echo "  Access Key: ${AWS_ACCESS_KEY:0:10}..."
 echo ""
-echo "Note: Instances will use these user credentials for S3 access"
+echo "Note: Instances will use these SSO credentials for S3 access"
 
 # ============================================================================
 # STEP 4b: Get latest Amazon Linux 2 AMI (dynamic - never outdated)
@@ -256,7 +257,7 @@ echo "=========================================="
 # Install dependencies
 echo "Installing dependencies..."
 yum update -y
-amazon-linux-extras install python3.9 -y
+amazon-linux-extras install python.9 -y
 yum install git -y
 
 # Clone repository
@@ -280,6 +281,7 @@ cat > /home/ec2-user/.aws/credentials <<AWSCREDS
 [default]
 aws_access_key_id = ${AWS_ACCESS_KEY}
 aws_secret_access_key = ${AWS_SECRET_KEY}
+aws_session_token = ${AWS_SESSION_TOKEN}
 AWSCREDS
 
 cat > /home/ec2-user/.aws/config <<AWSCONFIG
@@ -301,7 +303,10 @@ aws s3 cp s3://${BUCKET}/${OUTPUT_PREFIX}/config/philter_one.json configs/philte
 
 # Get partition ID from instance tag
 echo "Getting partition assignment..."
-INSTANCE_ID=\$(ec2-metadata --instance-id | cut -d " " -f 2)
+TOKEN=\$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=\$(curl -s -H "X-aws-ec2-metadata-token: \$TOKEN" \
+    http://169.254.169.254/latest/meta-data/instance-id)
 PARTITION=\$(aws ec2 describe-tags \
     --region ${REGION} \
     --filters "Name=resource-id,Values=\$INSTANCE_ID" "Name=key,Values=Partition" \
@@ -334,7 +339,7 @@ cd /home/ec2-user/philter-plus-deidentification
         echo "Output to:  s3://${BUCKET}/${OUTPUT_PREFIX}/output/\${FOLDER_NAME}/" | tee -a /var/log/deidentify.log
         echo "==============================" | tee -a /var/log/deidentify.log
 
-        python3.9 process_parquet_aws.py \
+        python.9 process_parquet_aws.py \
             --input-path "\$SUBFOLDER_PATH" \
             --output-path "s3://${BUCKET}/${OUTPUT_PREFIX}/output/\${FOLDER_NAME}/" \
             --workers 120 \
@@ -392,6 +397,7 @@ for i in $(seq 0 $(($NUM_INSTANCES - 1))); do
         --image-id $AMI_ID \
         --instance-type $INSTANCE_TYPE \
         --key-name $KEY_NAME \
+        --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=2,HttpEndpoint=enabled" \
         --network-interfaces "DeviceIndex=0,SubnetId=${SUBNET_ID},Groups=${SG_IDS_COMMA},AssociatePublicIpAddress=true" \
         --user-data "$USER_DATA_B64" \
         --tag-specifications \

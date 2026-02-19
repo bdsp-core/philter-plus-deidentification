@@ -1,147 +1,90 @@
 #!/bin/bash
 #
-# TEST SCRIPT - Launch a tiny EC2 instance, read 1 parquet file schema, terminate.
+# TEST SCRIPT - Use existing EC2 instance to read 1 parquet file schema and upload to S3.
 #
-# Cost: < $0.001 (t3.micro for ~5 minutes)
-# Free tier: FREE if your account is under 750 hrs/month t2.micro usage
-#
-# Output: Schema saved to ./parquet_schema.txt
+# Output: Schema saved to s3://bdsp-site-mgb/philter-deidentify/schema_test.txt
 #
 
 set -e
 
 BUCKET="bdsp-site-mgb"
-INPUT_PREFIX="I0001_Notes/Notes_parquet_15_and_before/"  # Smallest subfolder
+INPUT_PREFIX="I0001_Notes/Notes_parquet_15_and_before/"
 REGION="us-east-1"
-INSTANCE_TYPE="t3.micro"          # Cheapest general purpose (~$0.01/hr)
 AWS_PROFILE="bidmc"
-KEY_NAME="bdsp-ec2"
-KEY_FILE="./bdsp-ec2.pem"
 OUTPUT_PREFIX="philter-deidentify"
-VPC_ID="vpc-0b19ba4d16f0f4695"          # bdsp-webapp-vpc
-SUBNET_ID="subnet-032f4ed8e15acf550"    # bdsp-webapp-subnet-public1-us-east-1a
-SG_IDS_COMMA="sg-0f0200d3a98d50585"    # launch-wizard-17
+INSTANCE_HOST="ec2-100-25-98-114.compute-1.amazonaws.com"
+KEY_FILE="/c/Users/bdsp/Downloads/testec2pem.pem"
 
 echo "=========================================="
-echo "EC2 Schema Test (t3.micro, < \$0.001)"
+echo "EC2 Schema Test (existing instance)"
 echo "=========================================="
 echo ""
 echo "Will:"
-echo "  1. Launch 1x t3.micro instance"
+echo "  1. SSH into $INSTANCE_HOST"
 echo "  2. Read schema from s3://$BUCKET/$INPUT_PREFIX"
 echo "  3. Save schema to s3://$BUCKET/$OUTPUT_PREFIX/schema_test.txt"
-echo "  4. Terminate instance automatically"
 echo ""
 read -p "Continue? (y/n) " -n 1 -r
 echo
 if [[ ! $REPLY =~ ^[Yy]$ ]]; then echo "Aborted."; exit 1; fi
 
 # ============================================================================
-# Get bidmc credentials
+# Get bidmc credentials (SSO - includes session token)
 # ============================================================================
 
-AWS_ACCESS_KEY=$(aws configure get aws_access_key_id --profile $AWS_PROFILE)
-AWS_SECRET_KEY=$(aws configure get aws_secret_access_key --profile $AWS_PROFILE)
+echo "Retrieving credentials from $AWS_PROFILE profile..."
+AWS_ACCESS_KEY=$(aws configure get aws_access_key_id --profile $AWS_PROFILE 2>/dev/null) || true
+AWS_SECRET_KEY=$(aws configure get aws_secret_access_key --profile $AWS_PROFILE 2>/dev/null) || true
+AWS_SESSION_TOKEN=$(aws configure get aws_session_token --profile $AWS_PROFILE 2>/dev/null) || true
 
 if [ -z "$AWS_ACCESS_KEY" ] || [ -z "$AWS_SECRET_KEY" ]; then
     echo "✗ Could not retrieve credentials from $AWS_PROFILE profile"
+    echo "  Make sure ~/.aws/credentials has a [$AWS_PROFILE] section with valid keys"
     exit 1
 fi
-echo "✓ Credentials retrieved"
+echo "✓ Credentials retrieved (Access Key: ${AWS_ACCESS_KEY:0:10}...)"
 
 # ============================================================================
-# Get latest Amazon Linux 2 AMI (dynamic - never outdated)
+# Run schema test on existing instance via SSH
 # ============================================================================
 
-echo "Looking up latest Amazon Linux 2 AMI..."
-AMI_ID=$(aws ec2 --profile $AWS_PROFILE describe-images \
-    --region $REGION \
-    --owners amazon \
-    --filters \
-        'Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2' \
-        'Name=state,Values=available' \
-    --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
-    --output text)
-echo "✓ AMI: $AMI_ID"
+echo ""
+echo "Connecting to $INSTANCE_HOST ..."
 
-# ============================================================================
-# Network Configuration
-# ============================================================================
-
-echo "Network configuration..."
-echo "✓ VPC:             $VPC_ID"
-echo "✓ Subnet:          $SUBNET_ID"
-echo "✓ Security Groups: $SG_IDS_COMMA"
-
-# ============================================================================
-# Check/create key pair
-# ============================================================================
-
-KEY_CHECK=$(aws ec2 --profile $AWS_PROFILE describe-key-pairs \
-    --region $REGION --key-names $KEY_NAME 2>&1) || true
-
-if echo "$KEY_CHECK" | grep -q "InvalidKeyPair.NotFound"; then
-    echo "Creating key pair: $KEY_NAME"
-
-    # Write to temp file first, then fix permissions, then move to final location
-    TEMP_KEY=$(mktemp /tmp/bdsp_key_XXXX.pem)
-    aws ec2 --profile $AWS_PROFILE create-key-pair \
-        --region $REGION --key-name $KEY_NAME \
-        --query 'KeyMaterial' --output text > "$TEMP_KEY"
-
-    # Move to final location
-    mv -f "$TEMP_KEY" "$KEY_FILE"
-
-    # Fix Windows permissions: strip inheritance, grant only current user
-    WIN_KEY_FILE="$(cygpath -w $KEY_FILE)"
-    icacls "$WIN_KEY_FILE" /inheritance:r > /dev/null
-    icacls "$WIN_KEY_FILE" /remove "BUILTIN\Users" > /dev/null 2>&1 || true
-    icacls "$WIN_KEY_FILE" /remove "BUILTIN\Administrators" > /dev/null 2>&1 || true
-    icacls "$WIN_KEY_FILE" /remove "NT AUTHORITY\SYSTEM" > /dev/null 2>&1 || true
-    icacls "$WIN_KEY_FILE" /grant:r "$(whoami):R" > /dev/null
-
-    echo "✓ Key pair created, PEM saved: $KEY_FILE"
-else
-    echo "✓ Key pair exists: $KEY_NAME"
-fi
-
-# ============================================================================
-# Write test user-data script
-# ============================================================================
-
-cat > ./test-user-data.sh <<USERDATA
-#!/bin/bash
-exec > >(tee /var/log/user-data.log) 2>&1
+ssh -i "$KEY_FILE" \
+    -o StrictHostKeyChecking=no \
+    -o ConnectTimeout=10 \
+    ec2-user@$INSTANCE_HOST bash <<REMOTE
 set -e
 
-echo "=== Schema Test Instance ==="
+echo "=== Schema Test ==="
 echo "Started: \$(date)"
 
-# Install minimal dependencies
-yum install -y python3 python3-pip git 2>/dev/null || true
-
-pip3 install --quiet pyarrow boto3 s3fs 2>/dev/null
+# Install minimal dependencies if not already present
+echo "Installing dependencies..."
+sudo yum install -y python python-pip 2>/dev/null | tail -1 || true
+pip3 install --quiet pyarrow boto3 s3fs 2>/dev/null || pip3 install pyarrow boto3 s3fs
 
 # Configure AWS credentials
-mkdir -p /root/.aws
-cat > /root/.aws/credentials <<CREDS
+mkdir -p ~/.aws
+cat > ~/.aws/credentials <<CREDS
 [default]
 aws_access_key_id = ${AWS_ACCESS_KEY}
 aws_secret_access_key = ${AWS_SECRET_KEY}
+aws_session_token = ${AWS_SESSION_TOKEN}
 CREDS
-cat > /root/.aws/config <<CONF
+cat > ~/.aws/config <<CONF
 [default]
 region = ${REGION}
 output = json
 CONF
-chmod 600 /root/.aws/credentials
-
+chmod 600 ~/.aws/credentials
 echo "✓ Credentials configured"
 
 # Find first parquet file
 echo "Finding first parquet file in s3://${BUCKET}/${INPUT_PREFIX} ..."
 FIRST_FILE=\$(aws s3 ls s3://${BUCKET}/${INPUT_PREFIX} --recursive \
-    | grep '\.parquet$' | head -1 | awk '{print \$4}')
+    | grep '\.parquet\$' | head -1 | awk '{print \$4}')
 
 if [ -z "\$FIRST_FILE" ]; then
     echo "ERROR: No parquet files found"
@@ -152,10 +95,9 @@ FIRST_FILE_PATH="s3://${BUCKET}/\$FIRST_FILE"
 echo "Found: \$FIRST_FILE_PATH"
 
 # Read schema using Python
-python3 - <<PYEOF
+python - <<PYEOF
 import pyarrow.parquet as pq
 import s3fs
-import json
 
 path = "\$FIRST_FILE_PATH"
 print(f"Reading schema from: {path}")
@@ -191,7 +133,6 @@ for i in range(metadata.num_row_groups):
 text = "\n".join(output)
 print(text)
 
-# Save locally
 with open("/tmp/parquet_schema.txt", "w") as f:
     f.write(text)
 
@@ -205,78 +146,12 @@ echo "✓ Schema uploaded to s3://${BUCKET}/${OUTPUT_PREFIX}/schema_test.txt"
 
 echo ""
 echo "=== Test Complete: \$(date) ==="
+REMOTE
 
-# Shut down the instance after completing (saves cost)
-shutdown -h now
-USERDATA
-
-echo "✓ Test script created"
-
-# Base64 encode for Windows-compatible passing to AWS CLI
-USER_DATA_B64=$(base64 -w 0 ./test-user-data.sh)
-
-# ============================================================================
-# Launch t3.micro instance
-# ============================================================================
-
-echo ""
-echo "Launching t3.micro test instance..."
-
-INSTANCE_ID=$(aws ec2 --profile $AWS_PROFILE run-instances \
-    --region $REGION \
-    --image-id $AMI_ID \
-    --instance-type $INSTANCE_TYPE \
-    --key-name $KEY_NAME \
-    --network-interfaces "DeviceIndex=0,SubnetId=${SUBNET_ID},Groups=${SG_IDS_COMMA},AssociatePublicIpAddress=true" \
-    --user-data "$USER_DATA_B64" \
-    --tag-specifications \
-        "ResourceType=instance,Tags=[
-            {Key=Name,Value=Philter-Schema-Test},
-            {Key=Project,Value=Philter-Deidentify}
-        ]" \
-    --query 'Instances[0].InstanceId' \
-    --output text)
-
-echo "✓ Instance launched: $INSTANCE_ID"
-echo ""
-echo "Waiting for instance to start..."
-aws ec2 --profile $AWS_PROFILE wait instance-running \
-    --region $REGION --instance-ids $INSTANCE_ID
-
-PUBLIC_IP=$(aws ec2 --profile $AWS_PROFILE describe-instances \
-    --region $REGION --instance-ids $INSTANCE_ID \
-    --query 'Reservations[0].Instances[0].PublicIpAddress' \
-    --output text)
-
-echo "✓ Instance running"
-echo "  Instance ID: $INSTANCE_ID"
-echo "  Public IP:   $PUBLIC_IP"
-echo ""
-echo "The instance will:"
-echo "  1. Install Python + pyarrow (~2-3 min)"
-echo "  2. Read parquet schema (~30 sec)"
-echo "  3. Upload schema to S3"
-echo "  4. Shut itself down automatically"
 echo ""
 echo "========================================================"
-echo "To monitor (optional SSH):"
-echo "  ssh -i $KEY_FILE ec2-user@$PUBLIC_IP"
-echo "  sudo tail -f /var/log/user-data.log"
+echo "✓ Schema test complete"
 echo ""
-echo "To wait for schema result:"
-echo "  Watch for: s3://$BUCKET/$OUTPUT_PREFIX/schema_test.txt"
-echo "  Check with:"
-echo "  aws s3 ls s3://$BUCKET/$OUTPUT_PREFIX/schema_test.txt --profile $AWS_PROFILE"
-echo ""
-echo "To download schema when ready:"
+echo "To download schema:"
 echo "  aws s3 cp s3://$BUCKET/$OUTPUT_PREFIX/schema_test.txt ./parquet_schema.txt --profile $AWS_PROFILE"
-echo "  cat ./parquet_schema.txt"
-echo ""
-echo "Instance auto-terminates when done. Or terminate manually:"
-echo "  aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region $REGION --profile $AWS_PROFILE"
 echo "========================================================"
-
-# Save instance ID
-echo $INSTANCE_ID > /tmp/test-instance-id.txt
-echo ""
-echo "Instance ID saved to: /tmp/test-instance-id.txt"
