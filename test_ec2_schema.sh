@@ -18,7 +18,9 @@ AWS_PROFILE="bidmc"
 KEY_NAME="philter-key"
 KEY_FILE="./philter-key.pem"
 OUTPUT_PREFIX="philter-deidentify"
-REFERENCE_INSTANCE="i-00f062d5c9c4797c5"  # Copy network config from this instance
+VPC_ID="vpc-0b19ba4d16f0f4695"          # bdsp-webapp-vpc
+SUBNET_ID="subnet-032f4ed8e15acf550"    # bdsp-webapp-subnet-public1-us-east-1a
+SG_IDS_COMMA="sg-0f0200d3a98d50585"    # launch-wizard-17
 
 echo "=========================================="
 echo "EC2 Schema Test (t3.micro, < \$0.001)"
@@ -63,31 +65,11 @@ AMI_ID=$(aws ec2 --profile $AWS_PROFILE describe-images \
 echo "✓ AMI: $AMI_ID"
 
 # ============================================================================
-# Copy Network Config from Reference Instance
+# Network Configuration
 # ============================================================================
 
-echo "Copying network config from reference instance $REFERENCE_INSTANCE..."
-
-SUBNET_ID=$(aws ec2 --profile $AWS_PROFILE describe-instances \
-    --region $REGION \
-    --instance-ids $REFERENCE_INSTANCE \
-    --query 'Reservations[0].Instances[0].SubnetId' \
-    --output text)
-
-SG_IDS=$(aws ec2 --profile $AWS_PROFILE describe-instances \
-    --region $REGION \
-    --instance-ids $REFERENCE_INSTANCE \
-    --query 'Reservations[0].Instances[0].SecurityGroups[*].GroupId' \
-    --output text)
-
-if [ -z "$SUBNET_ID" ] || [ "$SUBNET_ID" = "None" ]; then
-    echo "✗ Could not retrieve subnet from reference instance"
-    exit 1
-fi
-
-# Convert tab-separated SG IDs to comma-separated for network-interfaces
-SG_IDS_COMMA=$(echo "$SG_IDS" | tr '\t' ',')
-
+echo "Network configuration..."
+echo "✓ VPC:             $VPC_ID"
 echo "✓ Subnet:          $SUBNET_ID"
 echo "✓ Security Groups: $SG_IDS_COMMA"
 
