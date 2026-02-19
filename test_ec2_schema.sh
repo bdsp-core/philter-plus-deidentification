@@ -82,10 +82,24 @@ KEY_CHECK=$(aws ec2 --profile $AWS_PROFILE describe-key-pairs \
 
 if echo "$KEY_CHECK" | grep -q "InvalidKeyPair.NotFound"; then
     echo "Creating key pair: $KEY_NAME"
+
+    # Remove old file if exists (force-delete to avoid permission errors)
+    rm -f "$KEY_FILE" 2>/dev/null || true
+    icacls "$(cygpath -w $KEY_FILE)" /grant:r "$(whoami):F" > /dev/null 2>&1 || true
+    rm -f "$KEY_FILE" 2>/dev/null || true
+
     aws ec2 --profile $AWS_PROFILE create-key-pair \
         --region $REGION --key-name $KEY_NAME \
         --query 'KeyMaterial' --output text > "$KEY_FILE"
-    chmod 400 "$KEY_FILE"
+
+    # Fix Windows permissions: strip inheritance, grant only current user
+    WIN_KEY_FILE="$(cygpath -w $KEY_FILE)"
+    icacls "$WIN_KEY_FILE" /inheritance:r > /dev/null
+    icacls "$WIN_KEY_FILE" /remove "BUILTIN\Users" > /dev/null 2>&1 || true
+    icacls "$WIN_KEY_FILE" /remove "BUILTIN\Administrators" > /dev/null 2>&1 || true
+    icacls "$WIN_KEY_FILE" /remove "NT AUTHORITY\SYSTEM" > /dev/null 2>&1 || true
+    icacls "$WIN_KEY_FILE" /grant:r "$(whoami):R" > /dev/null
+
     echo "✓ Key pair created, PEM saved: $KEY_FILE"
 else
     echo "✓ Key pair exists: $KEY_NAME"

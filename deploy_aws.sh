@@ -148,6 +148,11 @@ KEY_CHECK=$(aws ec2 --profile $AWS_PROFILE describe-key-pairs \
 if echo "$KEY_CHECK" | grep -q "InvalidKeyPair.NotFound"; then
     echo "Creating new key pair: $KEY_NAME"
 
+    # Remove old file if exists (force-delete to avoid permission errors on Windows)
+    rm -f "$KEY_FILE" 2>/dev/null || true
+    icacls "$(cygpath -w $KEY_FILE)" /grant:r "$(whoami):F" > /dev/null 2>&1 || true
+    rm -f "$KEY_FILE" 2>/dev/null || true
+
     # Create key pair and save PEM file locally
     aws ec2 --profile $AWS_PROFILE create-key-pair \
         --region $REGION \
@@ -155,8 +160,13 @@ if echo "$KEY_CHECK" | grep -q "InvalidKeyPair.NotFound"; then
         --query 'KeyMaterial' \
         --output text > "$KEY_FILE"
 
-    # Secure the PEM file (chmod 400 = read-only for owner)
-    chmod 400 "$KEY_FILE"
+    # Fix Windows permissions: strip inheritance, grant only current user
+    WIN_KEY_FILE="$(cygpath -w $KEY_FILE)"
+    icacls "$WIN_KEY_FILE" /inheritance:r > /dev/null
+    icacls "$WIN_KEY_FILE" /remove "BUILTIN\Users" > /dev/null 2>&1 || true
+    icacls "$WIN_KEY_FILE" /remove "BUILTIN\Administrators" > /dev/null 2>&1 || true
+    icacls "$WIN_KEY_FILE" /remove "NT AUTHORITY\SYSTEM" > /dev/null 2>&1 || true
+    icacls "$WIN_KEY_FILE" /grant:r "$(whoami):R" > /dev/null
 
     echo "✓ Key pair created: $KEY_NAME"
     echo "✓ PEM file saved:   $KEY_FILE"
