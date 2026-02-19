@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=philter-deid
 #SBATCH --account=mlscwest
-#SBATCH --array=0-7
-#SBATCH --partition=basic
+#SBATCH --array=0-7%4
+#SBATCH --partition=dgx-a100
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=24
-#SBATCH --mem=350G
+#SBATCH --cpus-per-task=120
+#SBATCH --mem=900G
 #SBATCH --time=4-00:00:00
 #SBATCH --output=logs/philter_%A_%a.out
 #SBATCH --error=logs/philter_%A_%a.err
@@ -22,7 +22,7 @@ INPUT_BASE="${SCRATCH_DIR}/I0001_Notes"
 OUTPUT_BASE="${SCRATCH_DIR}/philter-deidentify/output"
 MINIFORGE_PATH="$HOME/miniforge3"
 PHILTER_CONFIG="configs/philter_one.json"
-WORKERS=20
+WORKERS=120   # dgx-a100: 128 cores, leave 8 for OS
 
 # ============================================================================
 # SUBFOLDER ASSIGNMENTS (array task ID → subfolder)
