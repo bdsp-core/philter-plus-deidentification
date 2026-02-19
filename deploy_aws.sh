@@ -27,8 +27,8 @@ INSTANCE_TYPE="c6i.32xlarge"
 REGION="us-east-1"
 MAX_SPOT_PRICE="5.50"  # On-demand price for c6i.32xlarge
 AWS_PROFILE="bidmc"  # AWS profile to use
-KEY_NAME="philter-key"            # EC2 key pair name
-KEY_FILE="./philter-key.pem"      # PEM file saved locally (same folder as this script)
+KEY_NAME="bdsp-ec2"               # EC2 key pair name
+KEY_FILE="./bdsp-ec2.pem"         # PEM file saved locally (same folder as this script)
 VPC_ID="vpc-0b19ba4d16f0f4695"          # bdsp-webapp-vpc
 SUBNET_ID="subnet-032f4ed8e15acf550"    # bdsp-webapp-subnet-public1-us-east-1a
 SG_IDS_COMMA="sg-0f0200d3a98d50585"    # launch-wizard-17
@@ -148,17 +148,16 @@ KEY_CHECK=$(aws ec2 --profile $AWS_PROFILE describe-key-pairs \
 if echo "$KEY_CHECK" | grep -q "InvalidKeyPair.NotFound"; then
     echo "Creating new key pair: $KEY_NAME"
 
-    # Remove old file if exists (force-delete to avoid permission errors on Windows)
-    rm -f "$KEY_FILE" 2>/dev/null || true
-    icacls "$(cygpath -w $KEY_FILE)" /grant:r "$(whoami):F" > /dev/null 2>&1 || true
-    rm -f "$KEY_FILE" 2>/dev/null || true
-
-    # Create key pair and save PEM file locally
+    # Write to temp file first, then fix permissions, then move to final location
+    TEMP_KEY=$(mktemp /tmp/bdsp_key_XXXX.pem)
     aws ec2 --profile $AWS_PROFILE create-key-pair \
         --region $REGION \
         --key-name $KEY_NAME \
         --query 'KeyMaterial' \
-        --output text > "$KEY_FILE"
+        --output text > "$TEMP_KEY"
+
+    # Move to final location
+    mv -f "$TEMP_KEY" "$KEY_FILE"
 
     # Fix Windows permissions: strip inheritance, grant only current user
     WIN_KEY_FILE="$(cygpath -w $KEY_FILE)"

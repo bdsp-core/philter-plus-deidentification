@@ -15,8 +15,8 @@ INPUT_PREFIX="I0001_Notes/Notes_parquet_15_and_before/"  # Smallest subfolder
 REGION="us-east-1"
 INSTANCE_TYPE="t3.micro"          # Cheapest general purpose (~$0.01/hr)
 AWS_PROFILE="bidmc"
-KEY_NAME="philter-key"
-KEY_FILE="./philter-key.pem"
+KEY_NAME="bdsp-ec2"
+KEY_FILE="./bdsp-ec2.pem"
 OUTPUT_PREFIX="philter-deidentify"
 VPC_ID="vpc-0b19ba4d16f0f4695"          # bdsp-webapp-vpc
 SUBNET_ID="subnet-032f4ed8e15acf550"    # bdsp-webapp-subnet-public1-us-east-1a
@@ -83,14 +83,14 @@ KEY_CHECK=$(aws ec2 --profile $AWS_PROFILE describe-key-pairs \
 if echo "$KEY_CHECK" | grep -q "InvalidKeyPair.NotFound"; then
     echo "Creating key pair: $KEY_NAME"
 
-    # Remove old file if exists (force-delete to avoid permission errors)
-    rm -f "$KEY_FILE" 2>/dev/null || true
-    icacls "$(cygpath -w $KEY_FILE)" /grant:r "$(whoami):F" > /dev/null 2>&1 || true
-    rm -f "$KEY_FILE" 2>/dev/null || true
-
+    # Write to temp file first, then fix permissions, then move to final location
+    TEMP_KEY=$(mktemp /tmp/bdsp_key_XXXX.pem)
     aws ec2 --profile $AWS_PROFILE create-key-pair \
         --region $REGION --key-name $KEY_NAME \
-        --query 'KeyMaterial' --output text > "$KEY_FILE"
+        --query 'KeyMaterial' --output text > "$TEMP_KEY"
+
+    # Move to final location
+    mv -f "$TEMP_KEY" "$KEY_FILE"
 
     # Fix Windows permissions: strip inheritance, grant only current user
     WIN_KEY_FILE="$(cygpath -w $KEY_FILE)"
