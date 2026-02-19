@@ -16,8 +16,30 @@ echo "=========================================="
 # Pre-flight checks
 # ============================================================================
 
+SCRATCH_DIR="/scratch/$USER"
+
 echo ""
-echo "1. Checking conda environment..."
+echo "1. Checking scratch directory..."
+if [ -d "$SCRATCH_DIR" ]; then
+    echo "   ✓ Scratch: $SCRATCH_DIR"
+    SCRATCH_FREE=$(df -h "$SCRATCH_DIR" | awk 'NR==2{print $4}')
+    echo "   Free space: $SCRATCH_FREE"
+else
+    echo "   ✗ Scratch dir not found: $SCRATCH_DIR"
+    echo "   Update SCRATCH_DIR in slurm_job.sh and this script"
+    exit 1
+fi
+
+if [ -d "${SCRATCH_DIR}/I0001_Notes" ]; then
+    echo "   ✓ Input data found: ${SCRATCH_DIR}/I0001_Notes"
+else
+    echo "   ✗ Input data NOT found: ${SCRATCH_DIR}/I0001_Notes"
+    echo "   Copy your data to scratch first."
+    exit 1
+fi
+
+echo ""
+echo "2. Checking conda environment..."
 conda activate philter 2>/dev/null && echo "   ✓ philter env found" || {
     echo "   ✗ philter conda environment not found"
     echo "   Run: bash setup_cluster_env.sh"

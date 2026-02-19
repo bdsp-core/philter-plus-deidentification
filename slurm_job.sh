@@ -32,14 +32,11 @@
 # CONFIGURATION - EDIT THESE
 # ============================================================================
 
-# Data location: set one of these
-# Option A: S3 paths (if cluster has internet + AWS credentials)
-INPUT_BASE="s3://bdsp-site-mgb/I0001_Notes"
-OUTPUT_BASE="s3://bdsp-site-mgb/philter-deidentify/output"
+# Scratch directory on the cluster - set this to your scratch path
+SCRATCH_DIR="/scratch/$USER"
 
-# Option B: Local/NFS paths (uncomment and set if data is mounted locally)
-# INPUT_BASE="/path/to/mounted/I0001_Notes"
-# OUTPUT_BASE="/path/to/output/philter-deidentify/output"
+INPUT_BASE="${SCRATCH_DIR}/I0001_Notes"
+OUTPUT_BASE="${SCRATCH_DIR}/philter-deidentify/output"
 
 PHILTER_CONFIG="configs/philter_one.json"
 WORKERS=20  # Leave 4 cores for OS overhead on 24-core nodes
