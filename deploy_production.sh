@@ -4,13 +4,17 @@
 #
 # Same approach as test_ec2_schema.sh:
 #   1. Create tarball of project locally
-#   2. For each instance: SCP tarball, SSH in, install deps, start processing
+#   2. For each instance: SCP tarball, SSH in, install deps
+#   3. Copy data FROM S3 to EC2 local disk (AWS session = 12hrs)
+#   4. Run de-identification on local data (runs ~3 days, no S3 needed)
+#   5. After completion, refresh credentials and copy results back to S3
 #
 # Usage:
 #   ./deploy_production.sh
 #
 # Monitoring:
 #   ./check_status.sh
+#   ssh -i <key> ec2-user@<ip> "tail -f /var/log/deidentify.log"
 #
 
 set -e
@@ -44,8 +48,13 @@ for i in $(seq 0 $((NUM_INSTANCES - 1))); do
 done
 echo ""
 echo "  Input:   s3://$BUCKET/$INPUT_PREFIX"
-echo "  Output:  s3://$BUCKET/$OUTPUT_PREFIX/output/"
+echo "  Output:  local on each EC2, then upload to S3 later"
 echo "  Workers: $WORKERS per instance ($((WORKERS * NUM_INSTANCES)) total)"
+echo ""
+echo "Data flow:"
+echo "  1. Copy Parquet files from S3 → EC2 local disk (within 12hr session)"
+echo "  2. De-identify locally (~3 days, no S3 access needed)"
+echo "  3. After completion, refresh credentials and upload results to S3"
 echo ""
 read -p "Continue? (y/n) " -n 1 -r
 echo
@@ -69,7 +78,7 @@ fi
 echo "✓ Credentials retrieved (Access Key: ${AWS_ACCESS_KEY:0:10}...)"
 
 # ============================================================================
-# Create tarball of project and upload partition assignments
+# Create tarball of project
 # ============================================================================
 
 echo ""
@@ -91,7 +100,10 @@ tar -czf "$TARBALL" \
 TARBALL_SIZE=$(du -h "$TARBALL" | cut -f1)
 echo "✓ Tarball created: $TARBALL ($TARBALL_SIZE)"
 
-# Create partition assignments
+# ============================================================================
+# Create partition assignments (9 subfolders → 4 instances)
+# ============================================================================
+
 echo ""
 echo "Creating partition assignments..."
 SUBFOLDERS=$(aws s3 --profile $AWS_PROFILE ls s3://$BUCKET/$INPUT_PREFIX \
@@ -108,17 +120,14 @@ for i in $(seq 0 $((NUM_INSTANCES - 1))); do
     > /tmp/partition_${i}.txt
     for j in $(seq $START $(( START + PER_INSTANCE - 1 ))); do
         if [ $j -lt $TOTAL ]; then
-            echo "s3://$BUCKET/$INPUT_PREFIX${SUBFOLDER_ARRAY[$j]}" >> /tmp/partition_${i}.txt
+            echo "${SUBFOLDER_ARRAY[$j]}" >> /tmp/partition_${i}.txt
         fi
     done
     COUNT=$(grep -c . /tmp/partition_${i}.txt 2>/dev/null || echo 0)
     echo "  Partition $i: $COUNT subfolders"
     cat /tmp/partition_${i}.txt | sed 's/^/    /'
-    aws s3 --profile $AWS_PROFILE cp /tmp/partition_${i}.txt \
-        s3://$BUCKET/$OUTPUT_PREFIX/assignments/partition_${i}.txt \
-        --region $REGION --quiet
 done
-echo "✓ Assignments uploaded to S3"
+echo "✓ Partition assignments created"
 
 # ============================================================================
 # Deploy to each instance (same pattern as test_ec2_schema.sh)
@@ -127,11 +136,15 @@ echo "✓ Assignments uploaded to S3"
 for PARTITION in $(seq 0 $((NUM_INSTANCES - 1))); do
 
     IP=${WORKER_IPS[$PARTITION]}
+    PARTITION_FILE="/tmp/partition_${PARTITION}.txt"
 
     echo ""
     echo "=========================================="
     echo "Deploying Worker-$PARTITION ($IP)"
     echo "=========================================="
+
+    # Read subfolder names for this partition
+    SUBFOLDERS_LIST=$(cat "$PARTITION_FILE" | tr '\n' ' ')
 
     echo ""
     echo "Uploading project to Worker-$PARTITION via SCP..."
@@ -229,23 +242,49 @@ chmod 600 ~/.aws/credentials
 echo "✓ AWS credentials configured"
 
 # -----------------------------------------------
-# Step 4: Download partition assignment
+# Step 4: Copy data from S3 to local disk
 # -----------------------------------------------
 echo ""
-echo "Step 4: Downloading partition assignment..."
+echo "Step 4: Copying Parquet data from S3 to local disk..."
+echo "  (Must complete within 12hr session window)"
+echo ""
 
-aws s3 cp s3://${BUCKET}/${OUTPUT_PREFIX}/assignments/partition_${PARTITION}.txt /tmp/my_subfolders.txt
-echo "Subfolders assigned to Worker-$PARTITION:"
-cat /tmp/my_subfolders.txt
+mkdir -p /home/ec2-user/input
+mkdir -p /home/ec2-user/output
+
+SUBFOLDERS="${SUBFOLDERS_LIST}"
+for SUBFOLDER in \$SUBFOLDERS; do
+    # Remove trailing slash for clean folder name
+    CLEAN_NAME=\$(echo "\$SUBFOLDER" | sed 's|/$||')
+    echo "  Downloading: s3://${BUCKET}/${INPUT_PREFIX}\${SUBFOLDER}"
+    echo "  Destination: /home/ec2-user/input/\${CLEAN_NAME}/"
+    mkdir -p /home/ec2-user/input/\${CLEAN_NAME}
+    aws s3 sync "s3://${BUCKET}/${INPUT_PREFIX}\${SUBFOLDER}" \
+        "/home/ec2-user/input/\${CLEAN_NAME}/" \
+        --quiet
+    FILE_COUNT=\$(ls /home/ec2-user/input/\${CLEAN_NAME}/*.parquet 2>/dev/null | wc -l)
+    FOLDER_SIZE=\$(du -sh /home/ec2-user/input/\${CLEAN_NAME}/ | cut -f1)
+    echo "  ✓ Downloaded: \${FILE_COUNT} files, \${FOLDER_SIZE}"
+    echo ""
+done
+
+TOTAL_SIZE=\$(du -sh /home/ec2-user/input/ | cut -f1)
+echo "✓ All data downloaded to /home/ec2-user/input/ (Total: \${TOTAL_SIZE})"
+echo ""
+echo "Disk usage:"
+df -h /home/ec2-user | head -2
 
 # -----------------------------------------------
 # Step 5: Start processing in background (nohup)
+#         Reads/writes LOCAL files only — no S3 needed
 # -----------------------------------------------
 echo ""
 echo "Step 5: Starting de-identification processing..."
 echo "  Workers: ${WORKERS}"
 echo "  Batch size: ${BATCH_SIZE}"
 echo "  Config: configs/philter_one.json"
+echo "  Input:  /home/ec2-user/input/ (LOCAL)"
+echo "  Output: /home/ec2-user/output/ (LOCAL)"
 
 cd /home/ec2-user/philter-plus-deidentification
 
@@ -261,50 +300,54 @@ TOTAL_START=\$(date +%s)
 
 echo "=========================================="
 echo "Partition ${PARTITION} processing started: \$(date)"
+echo "All data is LOCAL - no S3 access needed"
 echo "=========================================="
 
-while IFS= read -r SUBFOLDER_PATH; do
-    [ -z "\$SUBFOLDER_PATH" ] && continue
+for INPUT_DIR in /home/ec2-user/input/*/; do
+    [ ! -d "\$INPUT_DIR" ] && continue
 
-    FOLDER_NAME=\$(echo "\$SUBFOLDER_PATH" | sed "s|s3://||" | tr "/" "_" | sed "s/_\$//")
+    FOLDER_NAME=\$(basename "\$INPUT_DIR")
+    OUTPUT_DIR="/home/ec2-user/output/\${FOLDER_NAME}"
+    mkdir -p "\$OUTPUT_DIR"
 
     echo ""
     echo "=============================="
-    echo "Processing: \$SUBFOLDER_PATH"
-    echo "Output to:  s3://${BUCKET}/${OUTPUT_PREFIX}/output/\${FOLDER_NAME}/"
+    echo "Processing: \$INPUT_DIR"
+    echo "Output to:  \$OUTPUT_DIR"
     echo "Started at: \$(date)"
     echo "=============================="
 
     \$PYTHON process_parquet_aws.py \
-        --input-path "\$SUBFOLDER_PATH" \
-        --output-path "s3://${BUCKET}/${OUTPUT_PREFIX}/output/\${FOLDER_NAME}/" \
+        --input-path "\$INPUT_DIR" \
+        --output-path "\$OUTPUT_DIR" \
         --workers ${WORKERS} \
         --batch-size ${BATCH_SIZE} \
         --philter-config configs/philter_one.json \
         2>&1
 
     SUBFOLDER_NUM=\$(( SUBFOLDER_NUM + 1 ))
-    echo "Completed subfolder \$SUBFOLDER_NUM at \$(date)"
+    echo ""
+    echo "Completed subfolder \$SUBFOLDER_NUM (\$FOLDER_NAME) at \$(date)"
 
-done < /tmp/my_subfolders.txt
+done
 
 TOTAL_END=\$(date +%s)
 TOTAL_ELAPSED=\$(( TOTAL_END - TOTAL_START ))
 TOTAL_HOURS=\$(echo "scale=1; \$TOTAL_ELAPSED / 3600" | bc)
 
+echo ""
 echo "=========================================="
 echo "ALL SUBFOLDERS COMPLETE at \$(date)"
 echo "Partition ${PARTITION} finished"
 echo "Total subfolders: \$SUBFOLDER_NUM"
 echo "Total time: \${TOTAL_HOURS} hours"
 echo "=========================================="
-
-echo "Partition ${PARTITION} completed at \$(date). Subfolders: \$SUBFOLDER_NUM. Time: \${TOTAL_HOURS}h" \
-    | tee /tmp/processing-complete.log
-aws s3 cp /tmp/processing-complete.log \
-    s3://${BUCKET}/${OUTPUT_PREFIX}/logs/partition_${PARTITION}_complete.log
-aws s3 cp /var/log/deidentify.log \
-    s3://${BUCKET}/${OUTPUT_PREFIX}/logs/partition_${PARTITION}_deidentify.log
+echo ""
+echo "OUTPUT IS LOCAL at /home/ec2-user/output/"
+echo "To upload to S3, refresh credentials and run:"
+echo "  aws s3 sync /home/ec2-user/output/ s3://${BUCKET}/${OUTPUT_PREFIX}/output/"
+echo ""
+du -sh /home/ec2-user/output/*/
 
 ' >> /var/log/deidentify.log 2>&1 &
 
@@ -316,6 +359,12 @@ echo "=========================================="
 echo "Worker-$PARTITION STARTED"
 echo "  PID: \$PID"
 echo "  Log: tail -f /var/log/deidentify.log"
+echo ""
+echo "  Input (LOCAL):  /home/ec2-user/input/"
+echo "  Output (LOCAL): /home/ec2-user/output/"
+echo ""
+echo "  Processing runs locally — no S3 access needed"
+echo "  After completion, refresh credentials and upload to S3"
 echo "=========================================="
 REMOTE
 
@@ -333,23 +382,33 @@ echo "=========================================="
 echo "✓ PRODUCTION DEPLOYMENT COMPLETE"
 echo "=========================================="
 echo ""
-echo "All $NUM_INSTANCES workers are now processing in background."
+echo "All $NUM_INSTANCES workers are now processing LOCALLY."
+echo "AWS credentials are NOT needed during processing."
+echo ""
+echo "Data flow:"
+echo "  ✓ S3 → EC2 local disk     (done during setup)"
+echo "  → Local de-identification  (running now, ~3 days)"
+echo "  → EC2 local disk → S3     (you do this after completion)"
 echo ""
 echo "Monitoring:"
 echo ""
-echo "  1. Quick status:       ./check_status.sh"
-echo ""
-echo "  2. Completion logs:    aws s3 --profile $AWS_PROFILE ls s3://$BUCKET/$OUTPUT_PREFIX/logs/"
-echo ""
-echo "  3. Output files:       aws s3 --profile $AWS_PROFILE ls s3://$BUCKET/$OUTPUT_PREFIX/output/ --recursive --summarize"
-echo ""
-echo "  4. SSH to any worker:"
+echo "  SSH to any worker:"
 for i in $(seq 0 $((NUM_INSTANCES - 1))); do
     echo "     Worker-$i: ssh -i $KEY_FILE ec2-user@${WORKER_IPS[$i]}"
 done
 echo "     Then:   tail -f /var/log/deidentify.log"
 echo ""
-echo "  5. Download results:"
+echo "After completion (~3 days):"
+echo ""
+echo "  1. Refresh AWS credentials in ~/.aws/credentials"
+echo ""
+echo "  2. Upload results from each instance:"
+for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+    echo "     ssh -i $KEY_FILE ec2-user@${WORKER_IPS[$i]} \\"
+    echo "       'aws s3 sync /home/ec2-user/output/ s3://$BUCKET/$OUTPUT_PREFIX/output/'"
+    echo ""
+done
+echo "  3. Download all results locally:"
 echo "     aws s3 --profile $AWS_PROFILE sync s3://$BUCKET/$OUTPUT_PREFIX/output/ ./deidentified_output/"
 echo ""
 echo "=========================================="

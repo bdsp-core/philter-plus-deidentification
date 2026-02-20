@@ -199,9 +199,21 @@ aws s3 rm s3://bdsp-site-mgb/philter-deidentify/test_output/ --recursive --profi
 
 ## Production Deployment
 
+### Important: AWS Session Token Expires in 12 Hours
+
+The `bidmc` AWS credentials use a session token that expires after 12 hours. Since processing takes ~3 days, data must be copied to EC2 local disk **before** credentials expire. The pipeline:
+
+```
+Phase 1 (within 12hrs):  S3 → EC2 local disk (automated by deploy script)
+Phase 2 (~3 days):       De-identify on local disk (no AWS access needed)
+Phase 3 (after done):    Refresh credentials → upload EC2 local disk → S3
+```
+
 ### Setup
 
-1. Create **4 × c6i.32xlarge** EC2 instances in AWS Console (Spot recommended)
+1. Create **4 × c6i.32xlarge** EC2 instances in AWS Console
+   - **Storage: 500 GB gp3** (input + output data needs disk space)
+   - Spot recommended for cost savings
 2. Update `deploy_production.sh` with your instance IPs and PEM path:
 
 ```bash
@@ -234,11 +246,35 @@ For each of the 4 instances, the script:
    - Downloads NLTK data (averaged_perceptron_tagger, punkt)
    - Extracts project and installs requirements.txt
    - Writes AWS credentials to `~/.aws/credentials`
-   - Downloads partition assignment (which subfolders this instance processes)
-3. **Starts processing in background** via `nohup`
-4. **Disconnects SSH** and moves to the next instance
+3. **Copies data from S3 to local disk** (`/home/ec2-user/input/`)
+   - Each instance downloads only its assigned subfolders
+   - Must complete within 12-hour session window
+4. **Starts processing in background** via `nohup`
+   - Reads from `/home/ec2-user/input/` (LOCAL)
+   - Writes to `/home/ec2-user/output/` (LOCAL)
+   - No S3 access needed during processing
+5. **Disconnects SSH** and moves to the next instance
 
 Processing runs unattended. You can close your laptop — it continues on EC2.
+
+### Data on EC2 Instance
+
+```
+/home/ec2-user/
+├── input/                                   ← Copied from S3 during setup
+│   ├── Notes_parquet_15_and_before/
+│   │   ├── file1.parquet
+│   │   └── file2.parquet
+│   └── Notes_parquet_16_17/
+│       └── ...
+├── output/                                  ← De-identified results (LOCAL)
+│   ├── Notes_parquet_15_and_before/
+│   │   ├── batch_000000.parquet
+│   │   └── batch_000001.parquet
+│   └── Notes_parquet_16_17/
+│       └── ...
+└── philter-plus-deidentification/           ← Project code
+```
 
 ### Partition Assignments
 
@@ -251,24 +287,32 @@ Processing runs unattended. You can close your laptop — it continues on EC2.
 | Worker-2 | `Notes_parquet_21/`, `Notes_parquet_22/`, `Notes_parquet_25_26/` | ~122M+ |
 | Worker-3 | `Notes_parquet_23/`, `Notes_parquet_24/` | ~161M |
 
+### After Processing Completes (~3 days)
+
+1. **Refresh AWS credentials** in `~/.aws/credentials` on your local machine
+2. **Update credentials on each EC2 instance:**
+
+```bash
+# For each worker, SCP fresh credentials
+scp -i /path/to/key.pem ~/.aws/credentials ec2-user@<worker-ip>:~/.aws/credentials
+```
+
+3. **Upload results from each instance to S3:**
+
+```bash
+ssh -i /path/to/key.pem ec2-user@<worker-ip> \
+    'aws s3 sync /home/ec2-user/output/ s3://bdsp-site-mgb/philter-deidentify/output/'
+```
+
+4. **Download all results locally:**
+
+```bash
+aws s3 --profile bidmc sync s3://bdsp-site-mgb/philter-deidentify/output/ ./deidentified_output/
+```
+
 ---
 
 ## Monitoring
-
-### Quick status check
-
-```bash
-./check_status.sh
-```
-
-Shows: instance status, completed partitions, checkpoint progress, output file count.
-
-### Check completion logs
-
-```bash
-# See which partitions are done (when all 4 exist, the job is done)
-aws s3 --profile bidmc ls s3://bdsp-site-mgb/philter-deidentify/logs/
-```
 
 ### SSH into a worker for live progress
 
@@ -284,10 +328,22 @@ Progress: 5,000,000 / 62,500,000 (8.0%)
   ETA: 29.1 hours
 ```
 
-### Check output files
+### Check if processing is still running
 
 ```bash
-aws s3 --profile bidmc ls s3://bdsp-site-mgb/philter-deidentify/output/ --recursive --summarize
+ssh -i /path/to/key.pem ec2-user@<worker-ip> 'ps aux | grep process_parquet'
+```
+
+### Check local output files on instance
+
+```bash
+ssh -i /path/to/key.pem ec2-user@<worker-ip> 'du -sh /home/ec2-user/output/*'
+```
+
+### Check disk space
+
+```bash
+ssh -i /path/to/key.pem ec2-user@<worker-ip> 'df -h /home/ec2-user'
 ```
 
 ### Download results
