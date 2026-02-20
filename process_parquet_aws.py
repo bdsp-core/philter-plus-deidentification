@@ -100,10 +100,12 @@ def _process_batch(batch_data):
     Process a batch of records.
 
     Args:
-        batch_data: List of (note_id, deid_name, text, shifted_year) tuples
+        batch_data: List of (bdsp_patient_id, bdsp_encounter_id,
+                    shifted_contact_date, text, de_id_filename) tuples
 
     Returns:
-        List of (note_id, deid_text, deid_name, shifted_year) tuples
+        List of (bdsp_patient_id, bdsp_encounter_id, shifted_contact_date,
+                 deid_text, de_id_filename) tuples
     """
     global _philter_instance
 
@@ -113,14 +115,14 @@ def _process_batch(batch_data):
     texts_dict = {}
     record_map = {}
 
-    for note_id, deid_name, text, shifted_year in batch_data:
+    for bdsp_patient_id, bdsp_encounter_id, shifted_contact_date, text, de_id_filename in batch_data:
         if not text or len(str(text).strip()) == 0:
             continue
 
-        # Apply keyword removal first (belt and suspenders approach)
+        deid_key = str(de_id_filename)
         cleaned_text = keyword_removal.remove_keywords(str(text))
-        texts_dict[deid_name] = cleaned_text
-        record_map[deid_name] = (note_id, shifted_year)
+        texts_dict[deid_key] = cleaned_text
+        record_map[deid_key] = (bdsp_patient_id, bdsp_encounter_id, shifted_contact_date)
 
     if not texts_dict:
         return []
@@ -139,28 +141,32 @@ def _process_batch(batch_data):
         _philter_instance.filenames = list(texts_dict.keys())
         _philter_instance.map_coordinates()
 
-        for deid_name in texts_dict.keys():
+        for deid_key in texts_dict.keys():
             try:
                 deid_text = _fast_transform(
-                    texts_dict[deid_name],
-                    deid_name,
+                    texts_dict[deid_key],
+                    deid_key,
                     _philter_instance
                 )
-                note_id, shifted_year = record_map[deid_name]
-                results.append((note_id, deid_text, deid_name, shifted_year))
-            except:
+                bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
+                results.append((bdsp_patient_id, bdsp_encounter_id,
+                                shifted_contact_date, deid_text, deid_key))
+            except Exception as e1:
                 # Fallback to original method
                 try:
                     deid_text = _philter_instance.transform_text_asterisk(
-                        texts_dict[deid_name],
-                        deid_name
+                        texts_dict[deid_key],
+                        deid_key
                     )
-                    note_id, shifted_year = record_map[deid_name]
-                    results.append((note_id, deid_text, deid_name, shifted_year))
-                except:
-                    pass
-    except:
-        pass
+                    bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
+                    results.append((bdsp_patient_id, bdsp_encounter_id,
+                                    shifted_contact_date, deid_text, deid_key))
+                except Exception as e2:
+                    logger.warning(f"Worker {os.getpid()}: Failed record {deid_key}: fast={e1}, fallback={e2}")
+    except Exception as e:
+        logger.error(f"Worker {os.getpid()}: map_coordinates failed for {len(texts_dict)} texts: {e}")
+        import traceback
+        traceback.print_exc()
 
     return results
 
@@ -207,7 +213,7 @@ def load_checkpoint(checkpoint_path):
 
 def write_parquet_batch(results, output_path, batch_num):
     """Write results to Parquet file."""
-    df = pd.DataFrame(results, columns=['NoteCSNID', 'NoteTXT', 'DeIDNoteID', 'ShiftedContactYear'])
+    df = pd.DataFrame(results, columns=['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'NoteTXT', 'de_id_filename'])
     table = pa.Table.from_pandas(df)
 
     output_file = f"{output_path}/batch_{batch_num:06d}.parquet"
@@ -279,7 +285,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     logger.warning(f"  Memory: {df.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
 
     # Verify required columns
-    required_cols = ['NoteCSNID', 'DeIDNoteID', 'NoteTXT', 'ShiftedContactYear']
+    required_cols = ['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'NoteTXT', 'de_id_filename']
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         logger.error(f"Missing columns: {missing}")
@@ -306,7 +312,8 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
 
         # Prepare batch data
         batch_data = [
-            (row['NoteCSNID'], row['DeIDNoteID'], row['NoteTXT'], row['ShiftedContactYear'])
+            (row['BDSPPatientID'], row['bdsp_encounter_id'],
+             row['ShiftedContactDate'], row['NoteTXT'], row['de_id_filename'])
             for _, row in batch_df.iterrows()
         ]
 
@@ -320,11 +327,15 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         batch_results = pool.map(_process_batch, worker_batches)
 
         # Flatten results
+        batch_result_count = 0
         for result_list in batch_results:
             all_results.extend(result_list)
+            batch_result_count += len(result_list)
 
         total_processed += len(batch_data)
         batch_num += 1
+
+        logger.warning(f"  Batch {batch_num}: {len(batch_data)} input -> {batch_result_count} output")
 
         # Write output every 100K records
         if len(all_results) >= 100_000:
@@ -346,8 +357,11 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
             logger.warning(f"  ETA: {eta_seconds/3600:.1f} hours")
 
     # Write final batch
+    logger.warning(f"\nFinal results: {len(all_results)} records to write")
     if all_results:
         write_parquet_batch(all_results, output_path, batch_num)
+    else:
+        logger.warning("WARNING: No results produced! Check worker errors above.")
 
     # Cleanup
     pool.close()

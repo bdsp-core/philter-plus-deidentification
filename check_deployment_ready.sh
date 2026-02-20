@@ -19,7 +19,7 @@ if aws configure list --profile $AWS_PROFILE > /dev/null 2>&1; then
     echo "   ✓ Profile 'bidmc' exists"
 else
     echo "   ✗ Profile 'bidmc' not found"
-    echo "   Run: aws configure --profile bidmc"
+    echo "   Run: aws configure --profile bidmc  (config at ~/.aws/credentials)"
     exit 1
 fi
 
@@ -55,7 +55,7 @@ if [ -n "$AWS_ACCESS_KEY" ] && [ -n "$AWS_SECRET_KEY" ]; then
     echo "   Note: Instances will use these user credentials (no IAM roles)"
 else
     echo "   ✗ AWS credentials not found"
-    echo "   Run: aws configure --profile bidmc"
+    echo "   Run: aws configure --profile bidmc  (config at ~/.aws/credentials)"
     exit 1
 fi
 

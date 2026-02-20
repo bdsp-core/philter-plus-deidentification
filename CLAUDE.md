@@ -18,13 +18,13 @@ Run a full AWS deployment that:
 
 ## AWS Environment
 
-- **AWS Profile:** `bidmc` (configured locally via `aws configure --profile bidmc`)
+- **AWS Profile:** `bidmc` (configured at `~/.aws/credentials`)
 - **Region:** `us-east-1`
 - **S3 Bucket:** `bdsp-site-mgb` (pre-existing, do not create or delete)
 - **No IAM roles** — instances use `bidmc` user credentials written via user-data
 - **Reference EC2 instance:** `i-00f062d5c9c4797c5` — network config (subnet, security groups) is copied from this instance at deploy time
-- **SSH Key:** `philter-key` / `philter-key.pem` (saved locally, never committed to git)
-- **OS:** Windows 11, scripts run via Git Bash
+- **SSH Key:** `bdsp-ec2` / `/Users/anjanarayapureddy/Desktop/Philter/bdsp-ec2.pem` (never committed to git)
+- **OS:** macOS (Darwin), scripts run via zsh/bash
 
 ---
 
@@ -93,15 +93,27 @@ s3://bdsp-site-mgb/
 
 ---
 
-## Parquet Schema (Expected)
+## Parquet Schema
 
-Columns used by `process_parquet_aws.py`:
-- `NoteCSNID` — note identifier
-- `DeIDNoteID` — de-identified note name (used as filename key in Philter)
-- `NoteTXT` — the free text clinical note to de-identify
-- `ShiftedContactYear` — year (passed through to output unchanged)
+### Input columns (from S3):
+- `NoteCSNID`: string
+- `BDSPPatientID`: int32
+- `PMRNID`: string
+- `PatientEncounterID`: string
+- `ShiftedDays`: int32
+- `bdsp_encounter_id`: int64
+- `sum`: int64
+- `ShiftedContactDate`: string
+- `ShiftedContactYear`: int32
+- `NoteTXT`: string — the free text clinical note to de-identify
+- `de_id_filename`: string — used as filename key in Philter
 
-Output columns: `NoteCSNID`, `NoteTXT` (de-identified), `DeIDNoteID`, `ShiftedContactYear`
+### Output columns (written to S3):
+- `BDSPPatientID`: int32
+- `bdsp_encounter_id`: int64
+- `ShiftedContactDate`: string
+- `NoteTXT`: string (de-identified)
+- `de_id_filename`: string
 
 ---
 

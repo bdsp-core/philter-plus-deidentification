@@ -1,52 +1,62 @@
 #!/bin/bash
 #
-# ONE-COMMAND DEPLOYMENT for AWS Parquet Processing
+# ONE-COMMAND DEPLOYMENT for AWS Parquet De-identification
 #
 # Usage:
 #   ./deploy_aws.sh
 #
 # This script will:
-# 1. Create S3 bucket
-# 2. Upload config files
-# 3. Create/use SSH key pair (saved as philter-key.pem)
-# 4. Launch EC2 instances with auto-configuration
-# 5. Start processing automatically
+#   1. Verify S3 bucket access and partition input subfolders
+#   2. Upload project tarball + config to S3 (private repo — can't git clone)
+#   3. Create/use SSH key pair
+#   4. Launch 4 × c6i.32xlarge Spot instances
+#   5. Each instance auto-downloads project from S3 and starts processing
+#
+# Monitoring:
+#   ./check_status.sh
 #
 
 set -e
 
 # ============================================================================
-# CONFIGURATION - EDIT THESE
+# CONFIGURATION
 # ============================================================================
 
-BUCKET="bdsp-site-mgb"                    # S3 bucket (input and output in same bucket)
+BUCKET="bdsp-site-mgb"                    # S3 bucket (input and output)
 INPUT_PREFIX="I0001_Notes/"               # Input subfolder prefix
-OUTPUT_PREFIX="philter-deidentify"        # Output/logs/config prefix inside same bucket
-NUM_INSTANCES=8  # 8 instances = 1 per subfolder (optimal for this dataset)
+OUTPUT_PREFIX="philter-deidentify"        # Output/logs/config prefix
+NUM_INSTANCES=4                           # 4 × c6i.32xlarge
 INSTANCE_TYPE="c6i.32xlarge"
 REGION="us-east-1"
-MAX_SPOT_PRICE="5.50"  # On-demand price for c6i.32xlarge
-AWS_PROFILE="bidmc"  # AWS profile to use
-KEY_NAME="bdsp-ec2"               # EC2 key pair name
-KEY_FILE="./bdsp-ec2.pem"         # PEM file saved locally (same folder as this script)
-VPC_ID="vpc-0b19ba4d16f0f4695"          # bdsp-webapp-vpc
-SUBNET_ID="subnet-032f4ed8e15acf550"    # bdsp-webapp-subnet-public1-us-east-1a
-SG_IDS_COMMA="sg-0350d41bfbbc1f0b6"    # launch-wizard-20
+MAX_SPOT_PRICE="5.50"                     # Max spot price (on-demand = $5.44)
+AWS_PROFILE="bidmc"
+KEY_NAME="bdsp-ec2"
+KEY_FILE="/Users/anjanarayapureddy/Desktop/Philter/bdsp-ec2.pem"
+VPC_ID="vpc-0b19ba4d16f0f4695"            # bdsp-webapp-vpc
+SUBNET_ID="subnet-032f4ed8e15acf550"      # bdsp-webapp-subnet-public1-us-east-1a
+SG_IDS_COMMA="sg-0350d41bfbbc1f0b6"      # launch-wizard-20
+EBS_SIZE=100                              # GB per instance
 
 # ============================================================================
-# SETUP
+# SUMMARY
 # ============================================================================
 
 echo "=========================================="
-echo "AWS Philter Deployment Script"
+echo "AWS Philter Production Deployment"
 echo "=========================================="
 echo ""
 echo "Configuration:"
-echo "  Input:  s3://$BUCKET/$INPUT_PREFIX"
-echo "  Output: s3://$BUCKET/$OUTPUT_PREFIX/output/"
-echo "  Instances: $NUM_INSTANCES × $INSTANCE_TYPE"
-echo "  Region: $REGION"
-echo "  Spot Max Price: \$$MAX_SPOT_PRICE/hour"
+echo "  Input:     s3://$BUCKET/$INPUT_PREFIX"
+echo "  Output:    s3://$BUCKET/$OUTPUT_PREFIX/output/"
+echo "  Instances: $NUM_INSTANCES × $INSTANCE_TYPE (Spot)"
+echo "  Region:    $REGION"
+echo "  Workers:   120 per instance (480 total)"
+echo "  Spot Max:  \$$MAX_SPOT_PRICE/hour"
+echo "  EBS:       ${EBS_SIZE}GB gp3 per instance"
+echo ""
+echo "Estimated:"
+echo "  Time: ~2.5-3 days"
+echo "  Cost: ~\$300-350 (Spot)"
 echo ""
 read -p "Continue? (y/n) " -n 1 -r
 echo
@@ -56,14 +66,13 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
 fi
 
 # ============================================================================
-# STEP 1: Verify S3 Bucket Access (no bucket created)
+# STEP 1: Verify S3 Bucket Access
 # ============================================================================
 
 echo ""
 echo "Step 1: Verifying S3 bucket access..."
 if aws s3 --profile $AWS_PROFILE ls s3://$BUCKET --region $REGION > /dev/null 2>&1; then
     echo "✓ Bucket accessible: s3://$BUCKET"
-    echo "  Output will go to: s3://$BUCKET/$OUTPUT_PREFIX/"
 else
     echo "✗ Cannot access s3://$BUCKET"
     exit 1
@@ -76,7 +85,6 @@ fi
 echo ""
 echo "Step 1b: Listing subfolders in s3://$BUCKET/$INPUT_PREFIX ..."
 
-# List all "subdirectories" (common prefixes) under the input prefix
 SUBFOLDERS=$(aws s3 --profile $AWS_PROFILE ls s3://$BUCKET/$INPUT_PREFIX \
     --region $REGION \
     | grep "PRE " \
@@ -84,14 +92,13 @@ SUBFOLDERS=$(aws s3 --profile $AWS_PROFILE ls s3://$BUCKET/$INPUT_PREFIX \
 
 if [ -z "$SUBFOLDERS" ]; then
     echo "No subfolders found under s3://$BUCKET/$INPUT_PREFIX"
-    echo "Treating as a flat folder. Assigning entire path to all instances."
+    echo "Treating as a flat folder."
     for i in $(seq 0 $(($NUM_INSTANCES - 1))); do
         echo "s3://$BUCKET/$INPUT_PREFIX" > /tmp/partition_${i}.txt
         aws s3 --profile $AWS_PROFILE cp /tmp/partition_${i}.txt \
             s3://$BUCKET/$OUTPUT_PREFIX/assignments/partition_${i}.txt
     done
 else
-    # Convert to array - each entry is just "Notes_parquet_XX/", prepend full S3 path
     SUBFOLDER_ARRAY=($SUBFOLDERS)
     TOTAL=${#SUBFOLDER_ARRAY[@]}
     echo "Found $TOTAL subfolders:"
@@ -119,28 +126,49 @@ else
 fi
 
 # ============================================================================
-# STEP 2: Upload Config Files
+# STEP 2: Create Project Tarball and Upload to S3
 # ============================================================================
 
 echo ""
-echo "Step 2: Uploading Philter config..."
+echo "Step 2: Creating and uploading project tarball to S3..."
+echo "  (Repo is private — instances will download from S3 instead of git clone)"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TARBALL="/tmp/philter-project.tar.gz"
+
+tar -czf "$TARBALL" \
+    -C "$(dirname "$SCRIPT_DIR")" \
+    --exclude='.git' \
+    --exclude='data' \
+    --exclude='__pycache__' \
+    --exclude='*.pyc' \
+    --exclude='*.pem' \
+    --exclude='.env' \
+    "$(basename "$SCRIPT_DIR")"
+
+TARBALL_SIZE=$(du -h "$TARBALL" | cut -f1)
+echo "  Tarball size: $TARBALL_SIZE"
+
+aws s3 --profile $AWS_PROFILE cp "$TARBALL" \
+    s3://$BUCKET/$OUTPUT_PREFIX/config/philter-project.tar.gz \
+    --region $REGION
+
+echo "✓ Project uploaded to s3://$BUCKET/$OUTPUT_PREFIX/config/philter-project.tar.gz"
+
+# Upload Philter config separately
 if [ -f "configs/philter_one.json" ]; then
     aws s3 --profile $AWS_PROFILE cp configs/philter_one.json \
         s3://$BUCKET/$OUTPUT_PREFIX/config/philter_one.json --region $REGION
     echo "✓ Uploaded philter_one.json"
-else
-    echo "⚠ Warning: configs/philter_one.json not found!"
-    echo "  Please upload manually: aws s3 --profile $AWS_PROFILE cp configs/philter_one.json s3://$BUCKET/$OUTPUT_PREFIX/config/"
 fi
 
 # ============================================================================
-# STEP 3: Create SSH Key Pair
+# STEP 3: Setup SSH Key Pair
 # ============================================================================
 
 echo ""
 echo "Step 3: Setting up SSH key pair..."
 
-# Check if key pair already exists in AWS
 KEY_CHECK=$(aws ec2 --profile $AWS_PROFILE describe-key-pairs \
     --region $REGION \
     --key-names $KEY_NAME 2>&1) || true
@@ -148,7 +176,6 @@ KEY_CHECK=$(aws ec2 --profile $AWS_PROFILE describe-key-pairs \
 if echo "$KEY_CHECK" | grep -q "InvalidKeyPair.NotFound"; then
     echo "Creating new key pair: $KEY_NAME"
 
-    # Write to temp file first, then fix permissions, then move to final location
     TEMP_KEY=$(mktemp /tmp/bdsp_key_XXXX.pem)
     aws ec2 --profile $AWS_PROFILE create-key-pair \
         --region $REGION \
@@ -156,61 +183,43 @@ if echo "$KEY_CHECK" | grep -q "InvalidKeyPair.NotFound"; then
         --query 'KeyMaterial' \
         --output text > "$TEMP_KEY"
 
-    # Move to final location
     mv -f "$TEMP_KEY" "$KEY_FILE"
-
-    # Fix Windows permissions: strip inheritance, grant only current user
-    WIN_KEY_FILE="$(cygpath -w $KEY_FILE)"
-    icacls "$WIN_KEY_FILE" /inheritance:r > /dev/null
-    icacls "$WIN_KEY_FILE" /remove "BUILTIN\Users" > /dev/null 2>&1 || true
-    icacls "$WIN_KEY_FILE" /remove "BUILTIN\Administrators" > /dev/null 2>&1 || true
-    icacls "$WIN_KEY_FILE" /remove "NT AUTHORITY\SYSTEM" > /dev/null 2>&1 || true
-    icacls "$WIN_KEY_FILE" /grant:r "$(whoami):R" > /dev/null
+    chmod 400 "$KEY_FILE"
 
     echo "✓ Key pair created: $KEY_NAME"
-    echo "✓ PEM file saved:   $KEY_FILE"
-    echo ""
-    echo "  IMPORTANT: Keep this file safe!"
-    echo "  You need it to SSH into instances for debugging:"
-    echo "  ssh -i $KEY_FILE ec2-user@<instance-ip>"
+    echo "✓ PEM file saved: $KEY_FILE"
 else
     echo "✓ Key pair already exists: $KEY_NAME"
     if [ -f "$KEY_FILE" ]; then
         echo "✓ PEM file found: $KEY_FILE"
     else
         echo "⚠ PEM file not found locally: $KEY_FILE"
-        echo "  If you need SSH access, re-create the key pair:"
-        echo "  aws ec2 delete-key-pair --key-name $KEY_NAME --profile $AWS_PROFILE --region $REGION"
-        echo "  Then re-run this script."
+        echo "  Re-create: aws ec2 delete-key-pair --key-name $KEY_NAME --profile $AWS_PROFILE --region $REGION"
+        exit 1
     fi
 fi
 
 # ============================================================================
-# STEP 4: Get AWS Credentials (using bidmc profile)
+# STEP 4: Get AWS Credentials
 # ============================================================================
 
 echo ""
-echo "Step 4: Configuring AWS credentials for instances..."
-echo "⚠ Using bidmc user credentials (not creating IAM roles)"
+echo "Step 4: Retrieving AWS credentials from $AWS_PROFILE profile..."
 
-# Get AWS credentials from the bidmc profile (reads directly from ~/.aws/credentials)
 AWS_ACCESS_KEY=$(aws configure get aws_access_key_id --profile $AWS_PROFILE 2>/dev/null) || true
 AWS_SECRET_KEY=$(aws configure get aws_secret_access_key --profile $AWS_PROFILE 2>/dev/null) || true
 AWS_SESSION_TOKEN=$(aws configure get aws_session_token --profile $AWS_PROFILE 2>/dev/null) || true
 
 if [ -z "$AWS_ACCESS_KEY" ] || [ -z "$AWS_SECRET_KEY" ]; then
-    echo "✗ Could not retrieve credentials from bidmc profile"
-    echo "  Make sure ~/.aws/credentials has a [bidmc] section with valid keys"
+    echo "✗ Could not retrieve credentials from $AWS_PROFILE profile"
+    echo "  Make sure ~/.aws/credentials has a [$AWS_PROFILE] section"
     exit 1
 fi
 
-echo "✓ Retrieved credentials from bidmc profile"
-echo "  Access Key: ${AWS_ACCESS_KEY:0:10}..."
-echo ""
-echo "Note: Instances will use these SSO credentials for S3 access"
+echo "✓ Credentials retrieved (Access Key: ${AWS_ACCESS_KEY:0:10}...)"
 
 # ============================================================================
-# STEP 4b: Get latest Amazon Linux 2 AMI (dynamic - never outdated)
+# STEP 4b: Get Latest Amazon Linux 2 AMI
 # ============================================================================
 
 echo ""
@@ -231,52 +240,64 @@ echo "✓ AMI: $AMI_ID"
 
 echo ""
 echo "Step 4c: Network configuration..."
-echo "✓ VPC:             $VPC_ID"
-echo "✓ Subnet:          $SUBNET_ID"
-echo "✓ Security Groups: $SG_IDS_COMMA"
+echo "  VPC:             $VPC_ID"
+echo "  Subnet:          $SUBNET_ID"
+echo "  Security Groups: $SG_IDS_COMMA"
 
 # ============================================================================
-# STEP 5: Create User Data Script
+# STEP 5: Create User Data Script (runs on each EC2 instance at boot)
 # ============================================================================
 
 echo ""
 echo "Step 5: Generating startup script..."
 
-cat > ./user-data.sh <<USERDATA
+cat > ./user-data.sh <<'USERDATA_START'
 #!/bin/bash
 set -e
 
-# Redirect output to log
-exec > >(tee /var/log/user-data.log)
-exec 2>&1
+# Redirect all output to log
+exec > >(tee /var/log/user-data.log) 2>&1
 
 echo "=========================================="
-echo "Instance Startup: \$(date)"
+echo "Instance Startup: $(date)"
 echo "=========================================="
 
-# Install dependencies
+# -----------------------------------------------
+# Install Python 3.9 and dependencies
+# -----------------------------------------------
 echo "Installing dependencies..."
-yum update -y
-amazon-linux-extras install python.9 -y
-yum install git -y
+yum update -y -q
+amazon-linux-extras install python3.9 -y
+yum install -y -q python39-pip
 
-# Clone repository
-echo "Cloning repository..."
-cd /home/ec2-user
-git clone https://github.com/bdsp-core/philter-plus-deidentification.git
-cd philter-plus-deidentification
-git checkout db_integrated
+PYTHON=$(command -v python3.9 || command -v python3)
+echo "Using Python: $PYTHON ($($PYTHON --version))"
 
-# Install Python packages
-echo "Installing Python packages..."
-pip3.9 install --upgrade pip
-pip3.9 install -r requirements.txt
-pip3.9 install pyarrow pandas boto3 s3fs
+$PYTHON -m pip install --upgrade pip -q
+$PYTHON -m pip install -q pyarrow pandas boto3 s3fs nltk
 
-# Configure AWS credentials (using bidmc user credentials)
+# Download NLTK data (required by Philter POS tagging)
+echo "Downloading NLTK data..."
+$PYTHON -c "
+import nltk
+nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+nltk.download('punkt', quiet=True)
+nltk.download('punkt_tab', quiet=True)
+print('NLTK data downloaded')
+"
+
+echo "✓ Dependencies installed"
+
+# -----------------------------------------------
+# Configure AWS credentials
+# -----------------------------------------------
 echo "Configuring AWS credentials..."
-mkdir -p /home/ec2-user/.aws
+mkdir -p /home/ec2-user/.aws /root/.aws
+USERDATA_START
 
+# Inject credentials (these variables are expanded at script generation time)
+cat >> ./user-data.sh <<USERDATA_CREDS
 cat > /home/ec2-user/.aws/credentials <<AWSCREDS
 [default]
 aws_access_key_id = ${AWS_ACCESS_KEY}
@@ -290,18 +311,34 @@ region = ${REGION}
 output = json
 AWSCONFIG
 
+# Root also needs credentials for user-data script phase
+cp /home/ec2-user/.aws/credentials /root/.aws/credentials
+cp /home/ec2-user/.aws/config /root/.aws/config
 chown -R ec2-user:ec2-user /home/ec2-user/.aws
-chmod 600 /home/ec2-user/.aws/credentials
-chmod 600 /home/ec2-user/.aws/config
-
+chmod 600 /home/ec2-user/.aws/credentials /root/.aws/credentials
 echo "✓ AWS credentials configured"
+USERDATA_CREDS
 
-# Download Philter config from S3
-echo "Downloading Philter config..."
-mkdir -p configs
-aws s3 cp s3://${BUCKET}/${OUTPUT_PREFIX}/config/philter_one.json configs/philter_one.json
+# Rest of user-data (no variable expansion needed)
+cat >> ./user-data.sh <<USERDATA_REST
+# -----------------------------------------------
+# Download project from S3 (private repo)
+# -----------------------------------------------
+echo "Downloading project from S3..."
+cd /home/ec2-user
+aws s3 cp s3://${BUCKET}/${OUTPUT_PREFIX}/config/philter-project.tar.gz /tmp/philter-project.tar.gz
+tar -xzf /tmp/philter-project.tar.gz
+cd philter-plus-deidentification
 
-# Get partition ID from instance tag
+# Install project requirements
+PYTHON=\$(command -v python3.9 || command -v python3)
+\$PYTHON -m pip install -q -r requirements.txt 2>/dev/null || true
+
+echo "✓ Project extracted and ready"
+
+# -----------------------------------------------
+# Get partition assignment from instance tag
+# -----------------------------------------------
 echo "Getting partition assignment..."
 TOKEN=\$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
     -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
@@ -312,55 +349,68 @@ PARTITION=\$(aws ec2 describe-tags \
     --filters "Name=resource-id,Values=\$INSTANCE_ID" "Name=key,Values=Partition" \
     --query 'Tags[0].Value' --output text)
 
-echo "Assigned to partition: \$PARTITION"
+echo "Instance: \$INSTANCE_ID, Partition: \$PARTITION"
 
-# Download the list of subfolders assigned to this instance
-echo "Downloading subfolder assignment list..."
+# Download subfolder assignment list
 aws s3 cp s3://${BUCKET}/${OUTPUT_PREFIX}/assignments/partition_\${PARTITION}.txt /tmp/my_subfolders.txt
 
 echo "Subfolders to process:"
 cat /tmp/my_subfolders.txt
 
+# -----------------------------------------------
 # Process each assigned subfolder
+# -----------------------------------------------
 cd /home/ec2-user/philter-plus-deidentification
-
-> /var/log/deidentify.log  # Create empty log
+> /var/log/deidentify.log
 
 (
     SUBFOLDER_NUM=0
+    TOTAL_START=\$(date +%s)
+
     while IFS= read -r SUBFOLDER_PATH; do
         [ -z "\$SUBFOLDER_PATH" ] && continue
 
-        # Derive a clean folder name for the output path
         FOLDER_NAME=\$(echo "\$SUBFOLDER_PATH" | sed 's|s3://||' | tr '/' '_' | sed 's/_\$//')
 
         echo "==============================" | tee -a /var/log/deidentify.log
         echo "Processing: \$SUBFOLDER_PATH"  | tee -a /var/log/deidentify.log
         echo "Output to:  s3://${BUCKET}/${OUTPUT_PREFIX}/output/\${FOLDER_NAME}/" | tee -a /var/log/deidentify.log
+        echo "Started at: \$(date)"          | tee -a /var/log/deidentify.log
         echo "==============================" | tee -a /var/log/deidentify.log
 
-        python.9 process_parquet_aws.py \
-            --input-path "\$SUBFOLDER_PATH" \
-            --output-path "s3://${BUCKET}/${OUTPUT_PREFIX}/output/\${FOLDER_NAME}/" \
-            --workers 120 \
-            --philter-config configs/philter_one.json \
+        \$PYTHON process_parquet_aws.py \\
+            --input-path "\$SUBFOLDER_PATH" \\
+            --output-path "s3://${BUCKET}/${OUTPUT_PREFIX}/output/\${FOLDER_NAME}/" \\
+            --workers 120 \\
+            --batch-size 10000 \\
+            --philter-config configs/philter_one.json \\
             >> /var/log/deidentify.log 2>&1
 
         SUBFOLDER_NUM=\$(( SUBFOLDER_NUM + 1 ))
-        echo "Completed subfolder \$SUBFOLDER_NUM" | tee -a /var/log/deidentify.log
+        echo "Completed subfolder \$SUBFOLDER_NUM at \$(date)" | tee -a /var/log/deidentify.log
 
     done < /tmp/my_subfolders.txt
 
-    echo "=========================================="  | tee -a /var/log/deidentify.log
-    echo "ALL SUBFOLDERS COMPLETE at \$(date)"         | tee -a /var/log/deidentify.log
-    echo "Partition \$PARTITION finished"               | tee -a /var/log/deidentify.log
-    echo "=========================================="  | tee -a /var/log/deidentify.log
+    TOTAL_END=\$(date +%s)
+    TOTAL_ELAPSED=\$(( TOTAL_END - TOTAL_START ))
+    TOTAL_HOURS=\$(echo "scale=1; \$TOTAL_ELAPSED / 3600" | bc)
+
+    echo "==========================================" | tee -a /var/log/deidentify.log
+    echo "ALL SUBFOLDERS COMPLETE at \$(date)"        | tee -a /var/log/deidentify.log
+    echo "Partition \$PARTITION finished"              | tee -a /var/log/deidentify.log
+    echo "Total subfolders: \$SUBFOLDER_NUM"          | tee -a /var/log/deidentify.log
+    echo "Total time: \${TOTAL_HOURS} hours"          | tee -a /var/log/deidentify.log
+    echo "==========================================" | tee -a /var/log/deidentify.log
 
     # Upload completion marker
-    echo "Processing completed at \$(date). Subfolders done: \$SUBFOLDER_NUM" \
+    echo "Partition \$PARTITION completed at \$(date). Subfolders: \$SUBFOLDER_NUM. Time: \${TOTAL_HOURS}h" \
         | tee /var/log/processing-complete.log
     aws s3 cp /var/log/processing-complete.log \
         s3://${BUCKET}/${OUTPUT_PREFIX}/logs/partition_\${PARTITION}_complete.log
+
+    # Upload final log
+    aws s3 cp /var/log/deidentify.log \
+        s3://${BUCKET}/${OUTPUT_PREFIX}/logs/partition_\${PARTITION}_deidentify.log
 
 ) &
 
@@ -370,21 +420,20 @@ echo \$PID > /var/run/deidentify.pid
 
 echo "=========================================="
 echo "Startup Complete: \$(date)"
-echo "Instance ready for processing"
 echo "=========================================="
-USERDATA
+USERDATA_REST
 
 echo "✓ User data script created"
 
-# Base64 encode for Windows-compatible passing to AWS CLI
-USER_DATA_B64=$(base64 -w 0 ./user-data.sh)
+# Base64 encode for AWS CLI
+USER_DATA_B64=$(base64 < ./user-data.sh)
 
 # ============================================================================
-# STEP 5: Launch EC2 Instances
+# STEP 6: Launch EC2 Instances
 # ============================================================================
 
 echo ""
-echo "Step 6: Launching $NUM_INSTANCES instances..."
+echo "Step 6: Launching $NUM_INSTANCES × $INSTANCE_TYPE Spot instances..."
 
 INSTANCE_IDS=()
 
@@ -399,6 +448,7 @@ for i in $(seq 0 $(($NUM_INSTANCES - 1))); do
         --key-name $KEY_NAME \
         --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=2,HttpEndpoint=enabled" \
         --network-interfaces "DeviceIndex=0,SubnetId=${SUBNET_ID},Groups=${SG_IDS_COMMA},AssociatePublicIpAddress=true" \
+        --block-device-mappings "[{\"DeviceName\":\"/dev/xvda\",\"Ebs\":{\"VolumeSize\":${EBS_SIZE},\"VolumeType\":\"gp3\",\"Iops\":3000,\"Throughput\":125}}]" \
         --user-data "$USER_DATA_B64" \
         --tag-specifications \
             "ResourceType=instance,Tags=[
@@ -416,24 +466,30 @@ for i in $(seq 0 $(($NUM_INSTANCES - 1))); do
 done
 
 # ============================================================================
-# STEP 6: Wait for Instances to Start
+# STEP 7: Wait for Instances to Start
 # ============================================================================
 
 echo ""
 echo "Step 7: Waiting for instances to start..."
 
-aws ec2 --profile $AWS_PROFILE wait instance-running --region $REGION --instance-ids ${INSTANCE_IDS[@]}
+aws ec2 --profile $AWS_PROFILE wait instance-running \
+    --region $REGION \
+    --instance-ids ${INSTANCE_IDS[@]}
 
 echo "✓ All instances running"
 
 # Get instance details
 echo ""
 echo "Instance Details:"
+echo "=========================================="
 aws ec2 --profile $AWS_PROFILE describe-instances \
     --region $REGION \
     --instance-ids ${INSTANCE_IDS[@]} \
     --query 'Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress,PrivateIpAddress,Tags[?Key==`Partition`].Value|[0]]' \
     --output table
+
+# Save instance IDs
+echo ${INSTANCE_IDS[@]} > /tmp/philter-instance-ids.txt
 
 # ============================================================================
 # SUMMARY
@@ -444,37 +500,28 @@ echo "=========================================="
 echo "✓ DEPLOYMENT COMPLETE"
 echo "=========================================="
 echo ""
-echo "Input:  s3://$BUCKET/$INPUT_PREFIX"
-echo "Output: s3://$BUCKET/$OUTPUT_PREFIX/output/"
-echo "Instances Launched: $NUM_INSTANCES"
+echo "  Input:     s3://$BUCKET/$INPUT_PREFIX"
+echo "  Output:    s3://$BUCKET/$OUTPUT_PREFIX/output/"
+echo "  Instances: $NUM_INSTANCES × $INSTANCE_TYPE"
+echo "  IDs:       ${INSTANCE_IDS[@]}"
 echo ""
-echo "Next Steps:"
+echo "Monitoring:"
 echo ""
-echo "1. Instances are already processing - no data upload needed!"
-echo "   Input is read directly from: s3://$BUCKET/$INPUT_PREFIX"
+echo "  1. Quick status check:"
+echo "     ./check_status.sh"
 echo ""
-echo "2. Monitor progress:"
-echo "   aws s3 --profile $AWS_PROFILE ls s3://$BUCKET/$OUTPUT_PREFIX/output/ --recursive --human-readable"
+echo "  2. Check completion logs:"
+echo "     aws s3 --profile $AWS_PROFILE ls s3://$BUCKET/$OUTPUT_PREFIX/logs/"
 echo ""
-echo "3. Check completion logs:"
-echo "   aws s3 --profile $AWS_PROFILE ls s3://$BUCKET/$OUTPUT_PREFIX/logs/"
+echo "  3. Check output files:"
+echo "     aws s3 --profile $AWS_PROFILE ls s3://$BUCKET/$OUTPUT_PREFIX/output/ --recursive --summarize"
 echo ""
-echo "4. SSH to instance for debugging (optional):"
-echo "   ssh -i $KEY_FILE ec2-user@<instance-ip>"
-echo "   tail -f /var/log/deidentify.log"
-echo "   tail -f /var/log/user-data.log"
+echo "  4. SSH to instance:"
+echo "     ssh -i $KEY_FILE ec2-user@<public-ip>"
+echo "     tail -f /var/log/deidentify.log"
 echo ""
-echo "   PEM key file location: $KEY_FILE"
-echo ""
-echo "5. Download results when done:"
-echo "   aws s3 --profile $AWS_PROFILE sync s3://$BUCKET/$OUTPUT_PREFIX/output/ ./deidentified_output/"
-echo ""
-echo "6. Cleanup when done:"
-echo "   ./cleanup_aws.sh --delete-s3"
+echo "  5. Download results when done:"
+echo "     aws s3 --profile $AWS_PROFILE sync s3://$BUCKET/$OUTPUT_PREFIX/output/ ./deidentified_output/"
 echo ""
 echo "=========================================="
-echo ""
-
-# Save instance IDs for later
-echo ${INSTANCE_IDS[@]} > /tmp/philter-instance-ids.txt
 echo "Instance IDs saved to: /tmp/philter-instance-ids.txt"
