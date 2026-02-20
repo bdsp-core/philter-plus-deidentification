@@ -242,49 +242,14 @@ chmod 600 ~/.aws/credentials
 echo "✓ AWS credentials configured"
 
 # -----------------------------------------------
-# Step 4: Copy data from S3 to local disk
+# Step 4: Start download + processing in background
+#         Everything runs inside nohup — SSH exits immediately
 # -----------------------------------------------
 echo ""
-echo "Step 4: Copying Parquet data from S3 to local disk..."
-echo "  (Must complete within 12hr session window)"
-echo ""
+echo "Step 4: Starting background job (S3 download + processing)..."
 
 mkdir -p /home/ec2-user/input
 mkdir -p /home/ec2-user/output
-
-SUBFOLDERS="${SUBFOLDERS_LIST}"
-for SUBFOLDER in \$SUBFOLDERS; do
-    # Remove trailing slash for clean folder name
-    CLEAN_NAME=\$(echo "\$SUBFOLDER" | sed 's|/$||')
-    echo "  Downloading: s3://${BUCKET}/${INPUT_PREFIX}\${SUBFOLDER}"
-    echo "  Destination: /home/ec2-user/input/\${CLEAN_NAME}/"
-    mkdir -p /home/ec2-user/input/\${CLEAN_NAME}
-    aws s3 sync "s3://${BUCKET}/${INPUT_PREFIX}\${SUBFOLDER}" \
-        "/home/ec2-user/input/\${CLEAN_NAME}/" \
-        --quiet
-    FILE_COUNT=\$(ls /home/ec2-user/input/\${CLEAN_NAME}/*.parquet 2>/dev/null | wc -l)
-    FOLDER_SIZE=\$(du -sh /home/ec2-user/input/\${CLEAN_NAME}/ | cut -f1)
-    echo "  ✓ Downloaded: \${FILE_COUNT} files, \${FOLDER_SIZE}"
-    echo ""
-done
-
-TOTAL_SIZE=\$(du -sh /home/ec2-user/input/ | cut -f1)
-echo "✓ All data downloaded to /home/ec2-user/input/ (Total: \${TOTAL_SIZE})"
-echo ""
-echo "Disk usage:"
-df -h /home/ec2-user | head -2
-
-# -----------------------------------------------
-# Step 5: Start processing in background (nohup)
-#         Reads/writes LOCAL files only — no S3 needed
-# -----------------------------------------------
-echo ""
-echo "Step 5: Starting de-identification processing..."
-echo "  Workers: ${WORKERS}"
-echo "  Batch size: ${BATCH_SIZE}"
-echo "  Config: configs/philter_one.json"
-echo "  Input:  /home/ec2-user/input/ (LOCAL)"
-echo "  Output: /home/ec2-user/output/ (LOCAL)"
 
 cd /home/ec2-user/philter-plus-deidentification
 
@@ -295,13 +260,46 @@ sudo chown ec2-user:ec2-user /var/log/deidentify.log
 
 nohup bash -c '
 PYTHON=\$(command -v python3.9 || command -v python3)
-SUBFOLDER_NUM=0
-TOTAL_START=\$(date +%s)
 
 echo "=========================================="
-echo "Partition ${PARTITION} processing started: \$(date)"
-echo "All data is LOCAL - no S3 access needed"
+echo "Worker-${PARTITION} background job started: \$(date)"
 echo "=========================================="
+
+# ----- Phase 1: Download data from S3 to local disk -----
+echo ""
+echo "PHASE 1: Downloading data from S3 to local disk..."
+echo "  (AWS credentials valid for ~12 hours)"
+echo ""
+
+SUBFOLDERS="${SUBFOLDERS_LIST}"
+for SUBFOLDER in \$SUBFOLDERS; do
+    CLEAN_NAME=\$(echo "\$SUBFOLDER" | sed "s|/$||")
+    echo "  Downloading: s3://${BUCKET}/${INPUT_PREFIX}\${SUBFOLDER}"
+    echo "  Destination: /home/ec2-user/input/\${CLEAN_NAME}/"
+    mkdir -p /home/ec2-user/input/\${CLEAN_NAME}
+    aws s3 sync "s3://${BUCKET}/${INPUT_PREFIX}\${SUBFOLDER}" \
+        "/home/ec2-user/input/\${CLEAN_NAME}/"
+    FILE_COUNT=\$(ls /home/ec2-user/input/\${CLEAN_NAME}/*.parquet 2>/dev/null | wc -l)
+    FOLDER_SIZE=\$(du -sh /home/ec2-user/input/\${CLEAN_NAME}/ | cut -f1)
+    echo "  Downloaded: \${FILE_COUNT} files, \${FOLDER_SIZE}"
+    echo ""
+done
+
+TOTAL_SIZE=\$(du -sh /home/ec2-user/input/ | cut -f1)
+echo "All data downloaded: \${TOTAL_SIZE}"
+echo "Disk usage:"
+df -h /home/ec2-user | head -2
+echo ""
+
+# ----- Phase 2: Process locally (no S3 needed) -----
+echo "=========================================="
+echo "PHASE 2: De-identification started: \$(date)"
+echo "All data is LOCAL - no AWS access needed from here"
+echo "=========================================="
+
+cd /home/ec2-user/philter-plus-deidentification
+SUBFOLDER_NUM=0
+TOTAL_START=\$(date +%s)
 
 for INPUT_DIR in /home/ec2-user/input/*/; do
     [ ! -d "\$INPUT_DIR" ] && continue
@@ -356,15 +354,13 @@ echo \$PID > /tmp/deidentify.pid
 
 echo ""
 echo "=========================================="
-echo "Worker-$PARTITION STARTED"
+echo "Worker-$PARTITION STARTED IN BACKGROUND"
 echo "  PID: \$PID"
 echo "  Log: tail -f /var/log/deidentify.log"
 echo ""
-echo "  Input (LOCAL):  /home/ec2-user/input/"
-echo "  Output (LOCAL): /home/ec2-user/output/"
-echo ""
-echo "  Processing runs locally — no S3 access needed"
-echo "  After completion, refresh credentials and upload to S3"
+echo "  Phase 1: Downloading from S3 (runs now)"
+echo "  Phase 2: De-identification (starts after download)"
+echo "  Both phases run in background — SSH will exit"
 echo "=========================================="
 REMOTE
 
