@@ -30,7 +30,7 @@ BATCH_SIZE=10000
 
 # 4 × c6i.32xlarge instances
 WORKER_IPS=(
-    "100.53.244.90"      # Worker-0
+    "34.238.27.34"       # Worker-0
     "34.206.72.182"      # Worker-1
     "44.203.218.128"     # Worker-2
     "44.211.88.59"       # Worker-3
@@ -113,16 +113,16 @@ SUBFOLDER_ARRAY=($SUBFOLDERS)
 TOTAL=${#SUBFOLDER_ARRAY[@]}
 echo "  Found $TOTAL subfolders"
 
-PER_INSTANCE=$(( ($TOTAL + $NUM_INSTANCES - 1) / $NUM_INSTANCES ))
+# Round-robin assignment so all instances get work
+for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+    > /tmp/partition_${i}.txt
+done
+for j in $(seq 0 $((TOTAL - 1))); do
+    INSTANCE=$(( j % NUM_INSTANCES ))
+    echo "${SUBFOLDER_ARRAY[$j]}" >> /tmp/partition_${INSTANCE}.txt
+done
 
 for i in $(seq 0 $((NUM_INSTANCES - 1))); do
-    START=$(( i * PER_INSTANCE ))
-    > /tmp/partition_${i}.txt
-    for j in $(seq $START $(( START + PER_INSTANCE - 1 ))); do
-        if [ $j -lt $TOTAL ]; then
-            echo "${SUBFOLDER_ARRAY[$j]}" >> /tmp/partition_${i}.txt
-        fi
-    done
     COUNT=$(grep -c . /tmp/partition_${i}.txt 2>/dev/null || echo 0)
     echo "  Partition $i: $COUNT subfolders"
     cat /tmp/partition_${i}.txt | sed 's/^/    /'

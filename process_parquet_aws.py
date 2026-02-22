@@ -38,11 +38,12 @@ logger = logging.getLogger(__name__)
 # Global worker state
 _philter_instance = None
 _philter_config_path = None
+_pattern_data_cache = None
 
 
 def _init_worker(config_path):
     """Initialize Philter once per worker."""
-    global _philter_instance, _philter_config_path
+    global _philter_instance, _philter_config_path, _pattern_data_cache
     _philter_config_path = config_path
 
     try:
@@ -54,6 +55,14 @@ def _init_worker(config_path):
             "run_eval": False
         }
         _philter_instance = Philter(philter_config)
+
+        # Cache pattern data references so we can restore after map_coordinates
+        # deletes "data" keys (instead of re-reading files from disk every batch)
+        import copy
+        _pattern_data_cache = {}
+        for i, pat in enumerate(_philter_instance.patterns):
+            if "data" in pat:
+                _pattern_data_cache[i] = copy.deepcopy(pat["data"])
     except Exception as e:
         logger.error(f"Worker {os.getpid()}: Philter init failed: {e}")
         raise
@@ -134,6 +143,12 @@ def _process_batch(batch_data):
     for phi_type in _philter_instance.phi_type_list:
         _philter_instance.phi_type_dict[phi_type][0].map.clear()
 
+    # Restore pattern data from cache (map_coordinates deletes "data" keys)
+    # Uses cached references from _init_worker instead of re-reading files from disk
+    import copy
+    for i, data in _pattern_data_cache.items():
+        _philter_instance.patterns[i]["data"] = copy.deepcopy(data)
+
     results = []
 
     try:
@@ -171,16 +186,16 @@ def _process_batch(batch_data):
     return results
 
 
-def save_checkpoint(checkpoint_path, processed_count, batch_num):
-    """Save progress checkpoint to S3."""
+def save_checkpoint(checkpoint_path, processed_count, batch_num, completed_files=None):
+    """Save progress checkpoint."""
     checkpoint = {
         'processed_count': processed_count,
         'batch_num': batch_num,
+        'completed_files': completed_files or [],
         'timestamp': datetime.now().isoformat()
     }
 
     if checkpoint_path.startswith('s3://'):
-        # Save to S3
         s3 = boto3.client('s3')
         bucket, key = checkpoint_path.replace('s3://', '').split('/', 1)
         s3.put_object(
@@ -189,13 +204,14 @@ def save_checkpoint(checkpoint_path, processed_count, batch_num):
             Body=json.dumps(checkpoint, indent=2)
         )
     else:
-        # Save locally
-        with open(checkpoint_path, 'w') as f:
+        os.makedirs(checkpoint_path, exist_ok=True)
+        local_file = os.path.join(checkpoint_path, 'checkpoint.json')
+        with open(local_file, 'w') as f:
             json.dump(checkpoint, f, indent=2)
 
 
 def load_checkpoint(checkpoint_path):
-    """Load progress checkpoint from S3."""
+    """Load progress checkpoint."""
     try:
         if checkpoint_path.startswith('s3://'):
             s3 = boto3.client('s3')
@@ -203,8 +219,9 @@ def load_checkpoint(checkpoint_path):
             obj = s3.get_object(Bucket=bucket, Key=f"{key}/checkpoint.json")
             return json.loads(obj['Body'].read())
         else:
-            if os.path.exists(checkpoint_path):
-                with open(checkpoint_path, 'r') as f:
+            local_file = os.path.join(checkpoint_path, 'checkpoint.json')
+            if os.path.exists(local_file):
+                with open(local_file, 'r') as f:
                     return json.load(f)
     except:
         pass
@@ -253,43 +270,54 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     logger.warning(f"Batch size: {batch_size}")
     logger.warning("=" * 80)
 
-    # Load checkpoint
+    # Load checkpoint to find already-completed files
     checkpoint = load_checkpoint(output_path)
-    start_batch = 0
+    completed_files = set()
     total_processed = 0
+    batch_num = 0
 
     if checkpoint:
-        logger.warning(f"Checkpoint found: {checkpoint['processed_count']:,} records processed")
-        logger.warning("Auto-resuming from checkpoint...")
-        start_batch = checkpoint['batch_num']
-        total_processed = checkpoint['processed_count']
+        completed_files = set(checkpoint.get('completed_files', []))
+        total_processed = checkpoint.get('processed_count', 0)
+        batch_num = checkpoint.get('batch_num', 0)
+        if completed_files:
+            logger.warning(f"Checkpoint found: {len(completed_files)} files already done, {total_processed:,} records processed")
+            logger.warning("Resuming — skipping completed files...")
 
-    # Read Parquet files
-    logger.warning("\nReading Parquet files...")
-    start_time = datetime.now()
+    # Discover Parquet files (one at a time to avoid OOM)
+    logger.warning("\nDiscovering Parquet files...")
 
     if input_path.startswith('s3://'):
         import s3fs
         fs = s3fs.S3FileSystem()
-        dataset = pq.ParquetDataset(input_path, filesystem=fs)
-        table = dataset.read()
+        parquet_files = sorted([f"s3://{f}" for f in fs.glob(f"{input_path.rstrip('/')}/*.parquet")])
     else:
-        dataset = pq.ParquetDataset(input_path)
-        table = dataset.read()
+        import glob
+        parquet_files = sorted(glob.glob(os.path.join(input_path, "*.parquet")))
 
-    df = table.to_pandas()
-    elapsed = (datetime.now() - start_time).total_seconds()
+    if not parquet_files:
+        logger.error(f"No parquet files found in {input_path}")
+        return
 
-    logger.warning(f"✓ Loaded {len(df):,} records in {elapsed:.1f}s")
-    logger.warning(f"  Columns: {list(df.columns)}")
-    logger.warning(f"  Memory: {df.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
+    # Filter out already-completed files
+    remaining_files = [f for f in parquet_files if os.path.basename(f) not in completed_files]
+    logger.warning(f"  Found {len(parquet_files)} parquet files, {len(remaining_files)} remaining to process")
 
-    # Verify required columns
+    if not remaining_files:
+        logger.warning("All files already processed! Nothing to do.")
+        return
+
+    # Verify schema from first remaining file
+    first_table = pq.read_table(remaining_files[0])
+    cols = first_table.column_names
     required_cols = ['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'NoteTXT', 'de_id_filename']
-    missing = [c for c in required_cols if c not in df.columns]
+    missing = [c for c in required_cols if c not in cols]
     if missing:
         logger.error(f"Missing columns: {missing}")
+        logger.error(f"Available columns: {cols}")
         return
+    logger.warning(f"  Columns: {cols}")
+    del first_table
 
     # Initialize worker pool
     logger.warning(f"\nInitializing {num_workers} workers...")
@@ -298,70 +326,82 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     init_elapsed = (datetime.now() - init_start).total_seconds()
     logger.warning(f"✓ Workers ready in {init_elapsed:.1f}s")
 
-    # Process in batches
+    # Process in batches — one parquet file at a time
     logger.warning("\n" + "=" * 80)
     logger.warning("PROCESSING STARTED")
     logger.warning("=" * 80)
 
     process_start = datetime.now()
-    batch_num = start_batch
     all_results = []
+    total_records = 0
 
-    for i in range(start_batch * batch_size, len(df), batch_size):
-        batch_df = df.iloc[i:i+batch_size]
+    for file_idx, parquet_file in enumerate(remaining_files):
+        file_start = datetime.now()
+        file_basename = os.path.basename(parquet_file)
+        logger.warning(f"\n--- File {file_idx+1}/{len(remaining_files)}: {file_basename} ---")
 
-        # Prepare batch data
-        batch_data = [
-            (row['BDSPPatientID'], row['bdsp_encounter_id'],
-             row['ShiftedContactDate'], row['NoteTXT'], row['de_id_filename'])
-            for _, row in batch_df.iterrows()
-        ]
+        table = pq.read_table(parquet_file)
+        df = table.to_pandas()
+        del table
 
-        # Split into sub-batches for parallel processing
-        worker_batch_size = max(1, len(batch_data) // num_workers)
-        worker_batches = []
-        for j in range(0, len(batch_data), worker_batch_size):
-            worker_batches.append(batch_data[j:j+worker_batch_size])
+        file_records = len(df)
+        total_records += file_records
+        logger.warning(f"  Loaded {file_records:,} records ({df.memory_usage(deep=True).sum() / 1024**3:.1f} GB)")
 
-        # Process in parallel
-        batch_results = pool.map(_process_batch, worker_batches)
+        for i in range(0, len(df), batch_size):
+            batch_df = df.iloc[i:i+batch_size]
 
-        # Flatten results
-        batch_result_count = 0
-        for result_list in batch_results:
-            all_results.extend(result_list)
-            batch_result_count += len(result_list)
+            # Prepare batch data
+            batch_data = [
+                (row['BDSPPatientID'], row['bdsp_encounter_id'],
+                 row['ShiftedContactDate'], row['NoteTXT'], row['de_id_filename'])
+                for _, row in batch_df.iterrows()
+            ]
 
-        total_processed += len(batch_data)
-        batch_num += 1
+            # Split into sub-batches for parallel processing
+            worker_batch_size = max(1, len(batch_data) // num_workers)
+            worker_batches = []
+            for j in range(0, len(batch_data), worker_batch_size):
+                worker_batches.append(batch_data[j:j+worker_batch_size])
 
-        logger.warning(f"  Batch {batch_num}: {len(batch_data)} input -> {batch_result_count} output")
+            # Process in parallel
+            batch_results = pool.map(_process_batch, worker_batches)
 
-        # Write output every 100K records
-        if len(all_results) >= 100_000:
+            # Flatten results
+            batch_result_count = 0
+            for result_list in batch_results:
+                all_results.extend(result_list)
+                batch_result_count += len(result_list)
+
+            total_processed += len(batch_data)
+            batch_num += 1
+
+            logger.warning(f"  Batch {batch_num}: {len(batch_data)} input -> {batch_result_count} output")
+
+        # Write output after EACH file (not every 100K) — crash-safe
+        if all_results:
             write_parquet_batch(all_results, output_path, batch_num)
             all_results = []
 
-            # Save checkpoint
-            save_checkpoint(output_path, total_processed, batch_num)
+        # Mark this file as completed in checkpoint
+        completed_files.add(file_basename)
+        save_checkpoint(output_path, total_processed, batch_num, list(completed_files))
 
-            # Progress update
-            elapsed = (datetime.now() - process_start).total_seconds()
-            rate = total_processed / elapsed if elapsed > 0 else 0
-            remaining = len(df) - total_processed
-            eta_seconds = remaining / rate if rate > 0 else 0
+        del df
+        file_elapsed = (datetime.now() - file_start).total_seconds()
 
-            logger.warning(f"")
-            logger.warning(f"Progress: {total_processed:,} / {len(df):,} ({total_processed/len(df)*100:.1f}%)")
-            logger.warning(f"  Speed: {rate:.1f} rec/sec")
-            logger.warning(f"  ETA: {eta_seconds/3600:.1f} hours")
+        # Progress update
+        elapsed = (datetime.now() - process_start).total_seconds()
+        rate = total_processed / elapsed if elapsed > 0 else 0
+        files_done = len(completed_files)
+        files_total = len(parquet_files)
 
-    # Write final batch
-    logger.warning(f"\nFinal results: {len(all_results)} records to write")
+        logger.warning(f"  File done in {file_elapsed/60:.1f} min")
+        logger.warning(f"  Progress: {files_done}/{files_total} files, {total_processed:,} records, {rate:.1f} rec/sec")
+
+    # Write any remaining results
     if all_results:
         write_parquet_batch(all_results, output_path, batch_num)
-    else:
-        logger.warning("WARNING: No results produced! Check worker errors above.")
 
     # Cleanup
     pool.close()
