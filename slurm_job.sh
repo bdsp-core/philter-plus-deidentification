@@ -16,6 +16,7 @@
 # SLURM DIRECTIVES
 # ============================================================================
 #SBATCH --job-name=philter-deid
+#SBATCH --account=mlscwest
 #SBATCH --array=0-7
 #SBATCH --partition=basic
 #SBATCH --nodes=1
@@ -32,12 +33,10 @@
 # CONFIGURATION - EDIT THESE
 # ============================================================================
 
-# Scratch directory on the cluster - set this to your scratch path
-SCRATCH_DIR="/scratch/$USER"
-
+SCRATCH_DIR="/vast/scratch/$USER"
 INPUT_BASE="${SCRATCH_DIR}/I0001_Notes"
 OUTPUT_BASE="${SCRATCH_DIR}/philter-deidentify/output"
-
+MINIFORGE_PATH="$HOME/miniforge3"
 PHILTER_CONFIG="configs/philter_one.json"
 WORKERS=20  # Leave 4 cores for OS overhead on 24-core nodes
 
@@ -77,16 +76,11 @@ echo "Workers:   $WORKERS"
 echo "CPUs:      $SLURM_CPUS_PER_TASK"
 echo "=========================================="
 
-# Load conda environment (adjust name to your environment)
-source ~/.bashrc
-conda activate philter 2>/dev/null || {
-    echo "ERROR: conda environment 'philter' not found."
-    echo "Run setup_cluster_env.sh first."
-    exit 1
-}
+module load miniforge
+source "${MINIFORGE_PATH}/bin/activate"
+conda activate philter
 
-echo "Python: $(which python3)"
-echo "Python version: $(python3 --version)"
+echo "Python: $(which python3) ($(python3 --version))"
 
 # ============================================================================
 # RUN DE-IDENTIFICATION
