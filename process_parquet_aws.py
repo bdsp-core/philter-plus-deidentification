@@ -12,7 +12,7 @@ Usage:
         --input-path s3://bucket/input/part1/ \
         --output-path s3://bucket/output/part1/ \
         --partition-id 1 \
-        --workers 120
+        --workers 30
 """
 import pyarrow.parquet as pq
 import pyarrow as pa
@@ -26,6 +26,7 @@ from multiprocessing import Pool, cpu_count
 import os
 import json
 import re
+import gc
 import boto3
 
 logging.basicConfig(
@@ -144,10 +145,10 @@ def _process_batch(batch_data):
         _philter_instance.phi_type_dict[phi_type][0].map.clear()
 
     # Restore pattern data from cache (map_coordinates deletes "data" keys)
-    # Uses cached references from _init_worker instead of re-reading files from disk
-    import copy
+    # Reference assignment — map_coordinates only reads data then deletes the key,
+    # it does not modify the data content itself, so sharing the reference is safe
     for i, data in _pattern_data_cache.items():
-        _philter_instance.patterns[i]["data"] = copy.deepcopy(data)
+        _philter_instance.patterns[i]["data"] = data
 
     results = []
 
@@ -182,6 +183,18 @@ def _process_batch(batch_data):
         logger.error(f"Worker {os.getpid()}: map_coordinates failed for {len(texts_dict)} texts: {e}")
         import traceback
         traceback.print_exc()
+
+    # Explicitly clear large objects and force garbage collection to prevent memory growth
+    texts_dict.clear()
+    record_map.clear()
+    _philter_instance.include_map.map.clear()
+    _philter_instance.exclude_map.map.clear()
+    _philter_instance.data_all_files.clear()
+    _philter_instance.texts.clear()
+    _philter_instance.filenames.clear()
+    for phi_type in _philter_instance.phi_type_list:
+        _philter_instance.phi_type_dict[phi_type][0].map.clear()
+    gc.collect()
 
     return results
 
@@ -249,7 +262,7 @@ def write_parquet_batch(results, output_path, batch_num):
     logger.warning(f"  Wrote batch {batch_num}: {len(results)} records to {output_file}")
 
 
-def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config):
+def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None):
     """
     Process a partition of Parquet files.
 
@@ -260,6 +273,8 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         num_workers: Number of parallel workers
         batch_size: Records per batch
         philter_config: Path to Philter config JSON
+        file_start: Index of first file to process (0-based)
+        file_end: Index of last file to process (exclusive, None=all)
     """
     logger.warning("=" * 80)
     logger.warning(f"PARTITION {partition_id}: Processing")
@@ -299,6 +314,12 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         logger.error(f"No parquet files found in {input_path}")
         return
 
+    # Apply file range selection (for splitting subfolders across instances)
+    if file_start > 0 or file_end is not None:
+        total_files = len(parquet_files)
+        parquet_files = parquet_files[file_start:file_end]
+        logger.warning(f"  File range: [{file_start}:{file_end}] — selected {len(parquet_files)} of {total_files} files")
+
     # Filter out already-completed files
     remaining_files = [f for f in parquet_files if os.path.basename(f) not in completed_files]
     logger.warning(f"  Found {len(parquet_files)} parquet files, {len(remaining_files)} remaining to process")
@@ -322,7 +343,8 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     # Initialize worker pool
     logger.warning(f"\nInitializing {num_workers} workers...")
     init_start = datetime.now()
-    pool = Pool(processes=num_workers, initializer=_init_worker, initargs=(philter_config,))
+    pool = Pool(processes=num_workers, initializer=_init_worker, initargs=(philter_config,),
+                maxtasksperchild=3)
     init_elapsed = (datetime.now() - init_start).total_seconds()
     logger.warning(f"✓ Workers ready in {init_elapsed:.1f}s")
 
@@ -348,35 +370,45 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         total_records += file_records
         logger.warning(f"  Loaded {file_records:,} records ({df.memory_usage(deep=True).sum() / 1024**3:.1f} GB)")
 
-        for i in range(0, len(df), batch_size):
-            batch_df = df.iloc[i:i+batch_size]
+        # Vectorized extraction (100x faster than iterrows)
+        file_data = list(zip(
+            df['BDSPPatientID'].values,
+            df['bdsp_encounter_id'].values,
+            df['ShiftedContactDate'].values,
+            df['NoteTXT'].values,
+            df['de_id_filename'].values
+        ))
+        del df  # Free dataframe memory early
 
-            # Prepare batch data
-            batch_data = [
-                (row['BDSPPatientID'], row['bdsp_encounter_id'],
-                 row['ShiftedContactDate'], row['NoteTXT'], row['de_id_filename'])
-                for _, row in batch_df.iterrows()
-            ]
+        # Split entire file into small sub-batches for dynamic scheduling
+        # Small sub-batches (200 records) prevent straggler workers from blocking others
+        # Processing entire file at once keeps all workers busy (no idle time between batches)
+        sub_batch_size = 200
+        worker_batches = [file_data[j:j+sub_batch_size]
+                          for j in range(0, len(file_data), sub_batch_size)]
+        logger.warning(f"  Split into {len(worker_batches)} sub-batches of {sub_batch_size} records")
 
-            # Split into sub-batches for parallel processing
-            worker_batch_size = max(1, len(batch_data) // num_workers)
-            worker_batches = []
-            for j in range(0, len(batch_data), worker_batch_size):
-                worker_batches.append(batch_data[j:j+worker_batch_size])
+        # Process with dynamic scheduling — fast workers grab next chunk immediately
+        file_result_count = 0
+        sub_batches_done = 0
+        progress_interval = max(1, len(worker_batches) // 10)  # Log ~10 times per file
 
-            # Process in parallel
-            batch_results = pool.map(_process_batch, worker_batches)
+        for result_list in pool.imap_unordered(_process_batch, worker_batches):
+            all_results.extend(result_list)
+            file_result_count += len(result_list)
+            sub_batches_done += 1
 
-            # Flatten results
-            batch_result_count = 0
-            for result_list in batch_results:
-                all_results.extend(result_list)
-                batch_result_count += len(result_list)
+            # Log progress periodically
+            if sub_batches_done % progress_interval == 0 or sub_batches_done == len(worker_batches):
+                elapsed_file = (datetime.now() - file_start).total_seconds()
+                rate = (sub_batches_done * sub_batch_size) / elapsed_file if elapsed_file > 0 else 0
+                pct = 100 * sub_batches_done / len(worker_batches)
+                logger.warning(f"  Progress: {sub_batches_done}/{len(worker_batches)} sub-batches ({pct:.0f}%), "
+                               f"{file_result_count:,} output, {rate:.1f} rec/sec")
 
-            total_processed += len(batch_data)
-            batch_num += 1
-
-            logger.warning(f"  Batch {batch_num}: {len(batch_data)} input -> {batch_result_count} output")
+        total_processed += file_records
+        batch_num += 1
+        del file_data
 
         # Write output after EACH file (not every 100K) — crash-safe
         if all_results:
@@ -387,7 +419,6 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         completed_files.add(file_basename)
         save_checkpoint(output_path, total_processed, batch_num, list(completed_files))
 
-        del df
         file_elapsed = (datetime.now() - file_start).total_seconds()
 
         # Progress update
@@ -427,6 +458,8 @@ def main():
     parser.add_argument('--workers', type=int, default=cpu_count(), help='Number of parallel workers')
     parser.add_argument('--batch-size', type=int, default=10000, help='Records per batch')
     parser.add_argument('--philter-config', default='configs/philter_one.json', help='Path to Philter config')
+    parser.add_argument('--file-start', type=int, default=0, help='Index of first file to process (0-based, for splitting subfolders)')
+    parser.add_argument('--file-end', type=int, default=None, help='Index of last file (exclusive, for splitting subfolders)')
 
     args = parser.parse_args()
 
@@ -442,7 +475,9 @@ def main():
         partition_id=args.partition_id,
         num_workers=args.workers,
         batch_size=args.batch_size,
-        philter_config=args.philter_config
+        philter_config=args.philter_config,
+        file_start=args.file_start,
+        file_end=args.file_end
     )
 
 
