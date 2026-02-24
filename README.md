@@ -30,7 +30,7 @@ Processing flow:
 S3 Parquet Input → Read batches → keyword_removal → Philter NLP → Write de-identified Parquet to S3
 ```
 
-Each EC2 instance runs 120 parallel workers using Python's `multiprocessing.Pool`. Checkpoints are saved to S3 after each batch for automatic resume on interruption.
+Each EC2 instance runs 30 parallel workers using Python's `multiprocessing.Pool` with `imap_unordered` for dynamic scheduling. Checkpoints are saved after each file for crash-safe resume on interruption.
 
 ---
 
@@ -86,13 +86,13 @@ The scripts **do not create** EC2 instances. You must create them manually in th
 | Setting | Value |
 |---------|-------|
 | **AMI** | Amazon Linux 2 (x86_64) |
-| **Instance Type** | `t3.micro` (test) or `c6i.32xlarge` (production) |
+| **Instance Type** | `t3.micro` (test) or `c6i.16xlarge` (production) |
 | **Key Pair** | Your PEM key |
 | **VPC** | `vpc-0b19ba4d16f0f4695` |
 | **Subnet** | `subnet-032f4ed8e15acf550` (public, us-east-1a) |
 | **Security Group** | `sg-0350d41bfbbc1f0b6` (launch-wizard-20) |
 | **Auto-assign Public IP** | Enabled |
-| **Storage** | 100 GB gp3 (production), 8 GB (test) |
+| **Storage** | 200 GB gp3 (production), 8 GB (test) |
 
 ### 3. PEM File
 
@@ -152,148 +152,187 @@ python read_parquet.py s3://bdsp-site-mgb/philter-deidentify/output/ --profile b
 
 ---
 
-## Testing on EC2
+## Testing on EC2 (Completed Feb 24, 2026)
 
-The test script (`test_ec2_schema.sh`) runs a small end-to-end test on a single EC2 instance to validate the full pipeline before production.
+Comprehensive testing was performed on a single **c6i.16xlarge** instance (64 vCPU, 128 GB RAM) in `us-east-1a` over 6+ hours. All tests passed.
 
-### Setup
+### Test A: Correctness (Single File)
 
-1. Create **1 × t3.micro** EC2 instance in AWS Console
-2. Update the script with your instance details:
+Processed 1 repartitioned file (~500K records) to validate de-identification quality.
+
+| Metric | Result |
+|--------|--------|
+| Input records | 500,000 |
+| Output records | 498,925 (99.8% retention) |
+| Output columns | `BDSPPatientID`, `bdsp_encounter_id`, `ShiftedContactDate`, `NoteTXT`, `de_id_filename` |
+| Star replacement ratio | 6.3% of characters replaced with `*` |
+| Speed | 86.7 rec/sec (first file, includes warmup) |
+| Memory | 19-20 GB (stable) |
+
+### Test B: Crash Recovery
+
+Started processing 2 files, killed the process after file 1 completed, restarted.
+
+| Metric | Result |
+|--------|--------|
+| Checkpoint detection | "Checkpoint found: 1 files already done" |
+| File 1 reprocessed? | No (correctly skipped) |
+| File 1 output intact? | Yes |
+| File 2 reprocessed? | Yes (re-started from beginning, as expected) |
+
+### Test C: Memory Stability & Sustained Speed (6+ hours)
+
+Ran the full `Notes_parquet_18_19` subfolder (191 repartitioned files, ~93M records) for 6+ hours continuously.
+
+| Metric | Result |
+|--------|--------|
+| Duration | 6+ hours (still running at test end) |
+| Files completed | 5 of 191 (~2.5M records) |
+| Speed (file 1, warmup) | 86.7 rec/sec |
+| Speed (files 2-5, sustained) | **130-145 rec/sec** |
+| Memory at start | 15 GB |
+| Memory at 6 hours | 32-34 GB (stable, no growth) |
+| OOM crashes | **None** |
+| Worker processes alive | 31 (1 main + 30 workers) throughout |
+
+### Key Optimizations Applied During Testing
+
+| Problem | Root Cause | Fix | Impact |
+|---------|-----------|-----|--------|
+| OOM crashes (120 workers) | Too many workers + deep copy memory growth | Reduced to 30 workers + reference assignment | Memory: 200+ GB → 32 GB stable |
+| Slow speed (12.5 rec/sec) | `pool.map()` straggler blocking | `pool.imap_unordered()` with 200-record sub-batches | Speed: 12.5 → 130+ rec/sec |
+| Memory growth over time | `copy.deepcopy(data)` per batch | Reference assignment (safe: map_coordinates only reads then deletes key) | Memory stable over 6+ hours |
+| Workers running out of work | Batch loop with only 50 sub-batches | Process entire file at once (2500 sub-batches for 500K records) | All 30 workers stay busy |
+| Slow data extraction | `df.iterrows()` | Vectorized `list(zip(df[col].values, ...))` | 100x faster extraction |
+
+### Running a Test
 
 ```bash
-# Edit test_ec2_schema.sh
-INSTANCE_HOST="ec2-XX-XX-XX-XX.compute-1.amazonaws.com"
-KEY_FILE="/path/to/your-test-key.pem"
-```
+# SSH into a c6i.16xlarge instance
+ssh -i /path/to/key.pem ec2-user@<ip>
 
-### Run
-
-```bash
-chmod +x test_ec2_schema.sh
-./test_ec2_schema.sh
-```
-
-### What it does
-
-1. Creates a tarball of the project (repo is private, can't git clone on EC2)
-2. SCPs tarball to the EC2 instance
-3. SSHes in and installs Python 3.9, pip packages, NLTK data
-4. Reads 500 rows from the first Parquet file in S3
-5. Runs full Philter de-identification (keyword_removal + Philter NLP)
-6. Writes output Parquet to S3 at `s3://bdsp-site-mgb/philter-deidentify/test_output/`
-7. Prints sample de-identified output for verification
-
-### Verify test output
-
-```bash
-# Download and inspect
-aws s3 sync s3://bdsp-site-mgb/philter-deidentify/test_output/ ./test_output/ --profile bidmc
-python read_parquet.py ./test_output/
-
-# Clean up test output
-aws s3 rm s3://bdsp-site-mgb/philter-deidentify/test_output/ --recursive --profile bidmc
+# Run on a single file
+python3.9 process_parquet_aws.py \
+    --input-path /home/ec2-user/test_input/ \
+    --output-path /home/ec2-user/test_output/ \
+    --workers 30 \
+    --philter-config configs/philter_one.json
 ```
 
 ---
 
-## Production Deployment
+## Production Deployment (11 × c6i.16xlarge Spot)
 
 ### Important: AWS Session Token Expires in 12 Hours
 
-The `bidmc` AWS credentials use a session token that expires after 12 hours. Since processing takes ~3 days, data must be copied to EC2 local disk **before** credentials expire. The pipeline:
+The `bidmc` AWS credentials use a session token that expires after 12 hours. Since processing takes ~5.5 days, data must be copied to EC2 local disk **before** credentials expire. The pipeline:
 
 ```
-Phase 1 (within 12hrs):  S3 → EC2 local disk (automated by deploy script)
-Phase 2 (~3 days):       De-identify on local disk (no AWS access needed)
+Phase 1 (within 12hrs):  S3 → EC2 local disk (download + repartition)
+Phase 2 (~5.5 days):     De-identify on local disk (no AWS access needed)
 Phase 3 (after done):    Refresh credentials → upload EC2 local disk → S3
 ```
 
-### Setup
+### Instance Configuration
 
-1. Create **4 × c6i.32xlarge** EC2 instances in AWS Console
-   - **Storage: 500 GB gp3** (input + output data needs disk space)
-   - Spot recommended for cost savings
-2. Update `deploy_production.sh` with your instance IPs and PEM path:
+| Setting | Value |
+|---------|-------|
+| Instance type | **c6i.16xlarge** (64 vCPU, 128 GB RAM) |
+| Pricing | **Spot** (~$1.10/hr, 60% cheaper than on-demand) |
+| EBS | **200 GB gp3** per instance |
+| Workers | 30 |
+| Sub-batch size | 200 records |
+| maxtasksperchild | 3 (periodic worker restart to control memory) |
+| Availability Zone | `us-east-1a` |
+| Subnet | `subnet-032f4ed8e15acf550` (CIDR: 10.224.10.0/28, 11 usable IPs) |
 
-```bash
-# Edit deploy_production.sh
-KEY_FILE="/path/to/your-production-key.pem"
-WORKER_IPS=(
-    "1.2.3.4"       # Worker-0
-    "5.6.7.8"       # Worker-1
-    "9.10.11.12"    # Worker-2
-    "13.14.15.16"   # Worker-3
-)
-```
+### Repartitioning
 
-3. Ensure SSH (port 22) is open for your current IP in the security group
-
-### Run
+Original S3 parquet files can be very large (up to 7.5M records per file). These must be split into ~500K record chunks to prevent OOM during processing. Each instance runs a repartition step after downloading from S3:
 
 ```bash
-chmod +x deploy_production.sh
-./deploy_production.sh
+# Repartitions large parquet files into ~500K record chunks
+python3.9 repartition.py /home/ec2-user/input/<subfolder>/ --max-rows 500000
 ```
 
-### What it does
+### Partition Assignments (11 instances)
 
-For each of the 4 instances, the script:
+The 3 largest subfolders are split across 2 instances each using `--file-start`/`--file-end`. Smaller subfolders get 1 instance each.
 
-1. **SCPs** the project tarball to the instance
-2. **SSHes in** and runs setup:
-   - Installs Python 3.9, pip, pyarrow, pandas, boto3, s3fs, nltk
-   - Downloads NLTK data (averaged_perceptron_tagger, punkt)
-   - Extracts project and installs requirements.txt
-   - Writes AWS credentials to `~/.aws/credentials`
-3. **Copies data from S3 to local disk** (`/home/ec2-user/input/`)
-   - Each instance downloads only its assigned subfolders
-   - Must complete within 12-hour session window
-4. **Starts processing in background** via `nohup`
-   - Reads from `/home/ec2-user/input/` (LOCAL)
-   - Writes to `/home/ec2-user/output/` (LOCAL)
-   - No S3 access needed during processing
-5. **Disconnects SSH** and moves to the next instance
+| # | Subfolder | File Range | ~Records | ~Days |
+|---|-----------|------------|----------|-------|
+| 1 | `Notes_parquet_18_19` | first half | ~47M | ~4 |
+| 2 | `Notes_parquet_18_19` | second half | ~46M | ~4 |
+| 3 | `Notes_parquet_24` | first half | ~46M | ~4 |
+| 4 | `Notes_parquet_24` | second half | ~45M | ~4 |
+| 5 | `Notes_parquet_23` first half + `Notes_parquet_15_and_before` | all | ~52M | ~4.5 |
+| 6 | `Notes_parquet_23` | second half | ~35M | ~3 |
+| 7 | `Notes_parquet_16_17` | first half | ~32M | ~3 |
+| 8 | `Notes_parquet_16_17` | second half | ~32M | ~3 |
+| 9 | `Notes_parquet_22` | all | ~62M | ~5.5 |
+| 10 | `Notes_parquet_21` | all | ~60M | ~5 |
+| 11 | `Notes_parquet_20` | all | ~55M | ~5 |
 
-Processing runs unattended. You can close your laptop — it continues on EC2.
+### Running with File Range Splitting
+
+For instances that process only part of a subfolder:
+
+```bash
+# Instance 1: first half of 18_19 (files 0-95)
+python3.9 process_parquet_aws.py \
+    --input-path /home/ec2-user/input/Notes_parquet_18_19/ \
+    --output-path /home/ec2-user/output/Notes_parquet_18_19_a/ \
+    --workers 30 --philter-config configs/philter_one.json \
+    --file-start 0 --file-end 96
+
+# Instance 2: second half of 18_19 (files 96+)
+python3.9 process_parquet_aws.py \
+    --input-path /home/ec2-user/input/Notes_parquet_18_19/ \
+    --output-path /home/ec2-user/output/Notes_parquet_18_19_b/ \
+    --workers 30 --philter-config configs/philter_one.json \
+    --file-start 96
+```
+
+For instances that process a full subfolder (no splitting needed):
+
+```bash
+python3.9 process_parquet_aws.py \
+    --input-path /home/ec2-user/input/Notes_parquet_22/ \
+    --output-path /home/ec2-user/output/Notes_parquet_22/ \
+    --workers 30 --philter-config configs/philter_one.json
+```
+
+### Checkpoint & Crash Recovery
+
+- Checkpoint saved after **each file** (not every N records)
+- On restart, completed files are **skipped automatically**
+- Only the current in-progress file is re-processed (~500K records, ~60 min)
+- Spot interruptions are handled gracefully — relaunch and resume
+- Output parquet files survive instance stop/restart (stored on EBS)
 
 ### Data on EC2 Instance
 
 ```
 /home/ec2-user/
-├── input/                                   ← Copied from S3 during setup
-│   ├── Notes_parquet_15_and_before/
-│   │   ├── file1.parquet
-│   │   └── file2.parquet
-│   └── Notes_parquet_16_17/
-│       └── ...
-├── output/                                  ← De-identified results (LOCAL)
-│   ├── Notes_parquet_15_and_before/
-│   │   ├── batch_000000.parquet
-│   │   └── batch_000001.parquet
-│   └── Notes_parquet_16_17/
-│       └── ...
+├── input/                                   ← Copied from S3, repartitioned
+│   └── Notes_parquet_18_19/
+│       ├── chunk_000000.parquet             (~500K records each)
+│       ├── chunk_000001.parquet
+│       └── ... (191 files for 18_19)
+├── output/                                  ← De-identified results
+│   └── Notes_parquet_18_19/
+│       ├── batch_000001.parquet
+│       ├── batch_000002.parquet
+│       └── checkpoint.json                  ← Tracks completed files
 └── philter-plus-deidentification/           ← Project code
 ```
 
-### Partition Assignments
-
-9 input subfolders are split across 4 instances:
-
-| Worker | Subfolders | Approx Records |
-|--------|-----------|----------------|
-| Worker-0 | `Notes_parquet_15_and_before/`, `Notes_parquet_16_17/` | ~81M |
-| Worker-1 | `Notes_parquet_18_19/`, `Notes_parquet_20/` | ~148M |
-| Worker-2 | `Notes_parquet_21/`, `Notes_parquet_22/`, `Notes_parquet_25_26/` | ~122M+ |
-| Worker-3 | `Notes_parquet_23/`, `Notes_parquet_24/` | ~161M |
-
-### After Processing Completes (~3 days)
+### After Processing Completes (~5.5 days)
 
 1. **Refresh AWS credentials** in `~/.aws/credentials` on your local machine
 2. **Update credentials on each EC2 instance:**
 
 ```bash
-# For each worker, SCP fresh credentials
 scp -i /path/to/key.pem ~/.aws/credentials ec2-user@<worker-ip>:~/.aws/credentials
 ```
 
@@ -318,26 +357,43 @@ aws s3 --profile bidmc sync s3://bdsp-site-mgb/philter-deidentify/output/ ./deid
 
 ```bash
 ssh -i /path/to/key.pem ec2-user@<worker-ip>
-tail -f /var/log/deidentify.log
+
+# Watch the log in real time
+tail -f /home/ec2-user/processing.log
 ```
 
 You'll see output like:
 ```
-Progress: 5,000,000 / 62,500,000 (8.0%)
-  Speed: 550.3 rec/sec
-  ETA: 29.1 hours
+--- File 12/191: chunk_000011.parquet ---
+  Loaded 500,000 records (2.1 GB)
+  Split into 2500 sub-batches of 200 records
+  Progress: 1250/2500 sub-batches (50%), 249,531 output, 143.6 rec/sec
+  Progress: 2500/2500 sub-batches (100%), 498,945 output, 138.7 rec/sec
+  Wrote batch 12: 498945 records to /home/ec2-user/output/.../batch_000012.parquet
+  File done in 60.2 min
+  Progress: 12/191 files, 6,000,000 records, 135.2 rec/sec
 ```
 
-### Check if processing is still running
+### Quick status check (one-liner)
 
 ```bash
-ssh -i /path/to/key.pem ec2-user@<worker-ip> 'ps aux | grep process_parquet'
+ssh -i /path/to/key.pem ec2-user@<worker-ip> \
+    'ps aux | grep process_parquet | grep -v grep | wc -l && echo "procs" && \
+     cat /home/ec2-user/output/*/checkpoint.json 2>/dev/null | python3.9 -c "import sys,json; d=json.load(sys.stdin); print(f\"Files: {len(d[\"completed_files\"])}, Records: {d[\"processed_count\"]:,}\")" && \
+     free -g | grep Mem'
+```
+
+### Check memory and worker health
+
+```bash
+ssh -i /path/to/key.pem ec2-user@<worker-ip> \
+    'free -g | grep Mem && ps aux | grep process_parquet | grep -v grep | wc -l && echo "processes"'
 ```
 
 ### Check local output files on instance
 
 ```bash
-ssh -i /path/to/key.pem ec2-user@<worker-ip> 'du -sh /home/ec2-user/output/*'
+ssh -i /path/to/key.pem ec2-user@<worker-ip> 'du -sh /home/ec2-user/output/* && ls /home/ec2-user/output/*/*.parquet | wc -l && echo "output files"'
 ```
 
 ### Check disk space
@@ -346,29 +402,34 @@ ssh -i /path/to/key.pem ec2-user@<worker-ip> 'du -sh /home/ec2-user/output/*'
 ssh -i /path/to/key.pem ec2-user@<worker-ip> 'df -h /home/ec2-user'
 ```
 
-### Download results
-
-```bash
-aws s3 --profile bidmc sync s3://bdsp-site-mgb/philter-deidentify/output/ ./deidentified_output/
-```
-
 ---
 
 ## Cost Estimate
 
-### Production (4 × c6i.32xlarge)
+### Production (11 × c6i.16xlarge Spot)
 
-| Resource | Spot Cost | On-Demand Cost |
-|----------|-----------|----------------|
-| 4 instances × ~70 hours | ~$450 | ~$1,520 |
-| EBS Storage (100GB × 4) | ~$32 | ~$32 |
-| **Total** | **~$300-500** | **~$1,550** |
+| Resource | Cost |
+|----------|------|
+| 11 spot instances × ~45 instance-days total | ~$1,200 |
+| EBS storage (200 GB × 11 × 5.5 days) | ~$32 |
+| S3 data transfer | ~$20-30 |
+| **Total** | **~$1,250** |
 
-Estimated runtime: **2.5-3 days**
+Estimated runtime: **~5.5 days** (bottleneck: largest unsplit subfolder at 62M records)
 
-### Test (1 × t3.micro)
+Most instances finish in 3-4 days. Only instances 9-11 (full medium subfolders) run the full 5-5.5 days.
 
-Negligible cost (~$0.01)
+### Spot vs On-Demand
+
+| | Spot | On-Demand |
+|---|------|-----------|
+| c6i.16xlarge hourly rate | ~$1.10/hr | $2.72/hr |
+| 11 instances × 5.5 days | **~$1,200** | **~$3,200** |
+| Interruption risk | ~5% (recovered via checkpoint) | None |
+
+### Testing Cost
+
+Single c6i.16xlarge on-demand for 24 hours: ~$65-70 (compute) + EBS
 
 ---
 
@@ -380,7 +441,7 @@ Negligible cost (~$0.01)
 | `test_ec2_schema.sh` | **Test script** — runs 500-row end-to-end test on 1 EC2 instance |
 | `check_status.sh` | **Monitoring** — checks completion logs, checkpoints, output files |
 | `check_deployment_ready.sh` | **Pre-flight checks** — verifies credentials, S3 access, config file |
-| `process_parquet_aws.py` | Runs on EC2 — reads Parquet from S3, de-identifies, writes output |
+| `process_parquet_aws.py` | Runs on EC2 — reads local Parquet, de-identifies with 30 workers, writes output. Supports `--file-start`/`--file-end` for splitting subfolders across instances |
 | `read_parquet.py` | Utility — read and print any Parquet file (local or S3) |
 | `philter.py` | Philter NLP de-identification engine |
 | `keyword_removal.py` | Site-specific keyword removal (hospital names, MRNs, etc.) |
@@ -403,10 +464,9 @@ s3://bdsp-site-mgb/
 │   ├── Notes_parquet_21/
 │   ├── Notes_parquet_22/
 │   ├── Notes_parquet_23/
-│   ├── Notes_parquet_24/
-│   └── Notes_parquet_25_26/
+│   └── Notes_parquet_24/
 └── philter-deidentify/                       ← OUTPUT
-    ├── assignments/partition_0..3.txt
+    ├── assignments/partition_0..10.txt
     ├── config/philter_one.json
     ├── output/                               ← De-identified Parquet files
     └── logs/partition_X_complete.log          ← Completion markers
