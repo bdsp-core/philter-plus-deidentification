@@ -21,7 +21,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
-#SBATCH --mem=350G
+#SBATCH --mem=96G
 #SBATCH --time=96:00:00
 #SBATCH --output=logs/philter_%A_%a.out
 #SBATCH --error=logs/philter_%A_%a.err

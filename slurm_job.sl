@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=120
-#SBATCH --mem=900G
+#SBATCH --mem=256G
 #SBATCH --time=4-00:00:00
 #SBATCH --output=logs/philter_%A_%a.out
 #SBATCH --error=logs/philter_%A_%a.err
@@ -22,7 +22,7 @@ INPUT_BASE="${SCRATCH_DIR}/I0001_Notes"
 OUTPUT_BASE="${SCRATCH_DIR}/philter-deidentify/output"
 MINIFORGE_PATH="$HOME/miniforge3"
 PHILTER_CONFIG="configs/philter_one.json"
-WORKERS=120   # dgx-a100: 128 cores, leave 8 for OS
+WORKERS=60    # 120 caused OOM; 60 workers stable at ~40 GB memory
 
 # ============================================================================
 # SUBFOLDER ASSIGNMENTS (array task ID → subfolder)
