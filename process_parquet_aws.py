@@ -2,10 +2,10 @@
 Parquet Processing Script for Hyper-Fast De-identification.
 
 Designed for:
-- Input: Parquet files from local filesystem or S3
-- Output: De-identified Parquet files
+- Input: Local Parquet files (from scratch/NFS)
+- Output: De-identified Parquet files to local filesystem
 - Multi-core processing with all optimizations
-- Checkpoint-based resume capability (crash-safe)
+- Checkpoint-based resume capability (crash-safe, SLURM preemption safe)
 
 Optimizations applied:
 - Pattern data caching (avoids file re-reads per batch)
@@ -19,8 +19,8 @@ Optimizations applied:
 
 Usage:
     python process_parquet_aws.py \
-        --input-path /path/to/input/ \
-        --output-path /path/to/output/ \
+        --input-path /scratch/user/I0001_Notes/Notes_parquet_20/ \
+        --output-path /scratch/user/philter-deidentify/output/Notes_parquet_20/ \
         --partition-id 1 \
         --workers 20
 """
@@ -37,7 +37,7 @@ import os
 import json
 import re
 import gc
-import boto3
+import glob
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -205,7 +205,7 @@ def _process_batch(batch_data):
 
 
 def save_checkpoint(checkpoint_path, processed_count, batch_num, completed_files=None):
-    """Save progress checkpoint."""
+    """Save progress checkpoint to local filesystem."""
     checkpoint = {
         'processed_count': processed_count,
         'batch_num': batch_num,
@@ -213,34 +213,19 @@ def save_checkpoint(checkpoint_path, processed_count, batch_num, completed_files
         'timestamp': datetime.now().isoformat()
     }
 
-    if checkpoint_path.startswith('s3://'):
-        s3 = boto3.client('s3')
-        bucket, key = checkpoint_path.replace('s3://', '').split('/', 1)
-        s3.put_object(
-            Bucket=bucket,
-            Key=f"{key}/checkpoint.json",
-            Body=json.dumps(checkpoint, indent=2)
-        )
-    else:
-        os.makedirs(checkpoint_path, exist_ok=True)
-        local_file = os.path.join(checkpoint_path, 'checkpoint.json')
-        with open(local_file, 'w') as f:
-            json.dump(checkpoint, f, indent=2)
+    os.makedirs(checkpoint_path, exist_ok=True)
+    local_file = os.path.join(checkpoint_path, 'checkpoint.json')
+    with open(local_file, 'w') as f:
+        json.dump(checkpoint, f, indent=2)
 
 
 def load_checkpoint(checkpoint_path):
-    """Load progress checkpoint."""
+    """Load progress checkpoint from local filesystem."""
     try:
-        if checkpoint_path.startswith('s3://'):
-            s3 = boto3.client('s3')
-            bucket, key = checkpoint_path.replace('s3://', '').split('/', 1)
-            obj = s3.get_object(Bucket=bucket, Key=f"{key}/checkpoint.json")
-            return json.loads(obj['Body'].read())
-        else:
-            local_file = os.path.join(checkpoint_path, 'checkpoint.json')
-            if os.path.exists(local_file):
-                with open(local_file, 'r') as f:
-                    return json.load(f)
+        local_file = os.path.join(checkpoint_path, 'checkpoint.json')
+        if os.path.exists(local_file):
+            with open(local_file, 'r') as f:
+                return json.load(f)
     except:
         pass
     return None
@@ -252,15 +237,8 @@ def write_parquet_batch(results, output_path, batch_num):
     table = pa.Table.from_pandas(df)
 
     output_file = f"{output_path}/batch_{batch_num:06d}.parquet"
-
-    if output_path.startswith('s3://'):
-        import s3fs
-        fs = s3fs.S3FileSystem()
-        with fs.open(output_file, 'wb') as f:
-            pq.write_table(table, f, compression='snappy')
-    else:
-        os.makedirs(output_path, exist_ok=True)
-        pq.write_table(table, output_file, compression='snappy')
+    os.makedirs(output_path, exist_ok=True)
+    pq.write_table(table, output_file, compression='snappy')
 
     logger.warning(f"  Wrote batch {batch_num}: {len(results)} records to {output_file}")
 
@@ -270,9 +248,9 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     Process a partition of Parquet files.
 
     Args:
-        input_path: S3 path or local path to input Parquet files
-        output_path: S3 path or local path for output
-        partition_id: ID of this partition
+        input_path: Local path to input Parquet files
+        output_path: Local path for output
+        partition_id: ID of this partition (SLURM array task ID)
         num_workers: Number of parallel workers
         batch_size: Records per batch
         philter_config: Path to Philter config JSON
@@ -305,19 +283,13 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     # Discover Parquet files (one at a time to avoid OOM)
     logger.warning("\nDiscovering Parquet files...")
 
-    if input_path.startswith('s3://'):
-        import s3fs
-        fs = s3fs.S3FileSystem()
-        parquet_files = sorted([f"s3://{f}" for f in fs.glob(f"{input_path.rstrip('/')}/*.parquet")])
-    else:
-        import glob
-        parquet_files = sorted(glob.glob(os.path.join(input_path, "*.parquet")))
+    parquet_files = sorted(glob.glob(os.path.join(input_path, "*.parquet")))
 
     if not parquet_files:
         logger.error(f"No parquet files found in {input_path}")
         return
 
-    # Apply file range selection (for splitting subfolders across instances)
+    # Apply file range selection (for splitting subfolders across SLURM tasks)
     if file_start > 0 or file_end is not None:
         total_files = len(parquet_files)
         parquet_files = parquet_files[file_start:file_end]
@@ -453,9 +425,9 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
 
 def main():
     parser = argparse.ArgumentParser(description='Process Parquet files with Philter de-identification')
-    parser.add_argument('--input-path', required=True, help='S3 or local path to input Parquet files')
-    parser.add_argument('--output-path', required=True, help='S3 or local path for output Parquet files')
-    parser.add_argument('--partition-id', type=int, default=1, help='Partition ID')
+    parser.add_argument('--input-path', required=True, help='Local path to input Parquet files')
+    parser.add_argument('--output-path', required=True, help='Local path for output Parquet files')
+    parser.add_argument('--partition-id', type=int, default=1, help='Partition ID (SLURM array task ID)')
     parser.add_argument('--workers', type=int, default=cpu_count(), help='Number of parallel workers')
     parser.add_argument('--batch-size', type=int, default=10000, help='Records per batch')
     parser.add_argument('--philter-config', default='configs/philter_one.json', help='Path to Philter config')
@@ -463,12 +435,6 @@ def main():
     parser.add_argument('--file-end', type=int, default=None, help='Index of last file (exclusive, for splitting subfolders)')
 
     args = parser.parse_args()
-
-    # Validate paths
-    if args.input_path.startswith('s3://'):
-        logger.warning("Using S3 for input (ensure AWS credentials are configured)")
-    if args.output_path.startswith('s3://'):
-        logger.warning("Using S3 for output (ensure AWS credentials are configured)")
 
     process_partition(
         input_path=args.input_path,
