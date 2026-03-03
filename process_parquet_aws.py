@@ -21,6 +21,7 @@ from philter import Philter
 import keyword_removal
 import argparse
 import logging
+import csv
 from datetime import datetime
 from multiprocessing import Pool, cpu_count
 import os
@@ -111,32 +112,36 @@ def _process_batch(batch_data):
     Process a batch of records.
 
     Args:
-        batch_data: List of (bdsp_patient_id, bdsp_encounter_id,
+        batch_data: List of (note_csn_id, bdsp_patient_id, bdsp_encounter_id,
                     shifted_contact_date, text, de_id_filename) tuples
 
     Returns:
-        List of (bdsp_patient_id, bdsp_encounter_id, shifted_contact_date,
-                 deid_text, de_id_filename) tuples
+        Tuple of:
+          - List of (bdsp_patient_id, bdsp_encounter_id, shifted_contact_date,
+                     deid_text, de_id_filename) tuples
+          - List of (NoteCSNID, de_id_filename, status) tuples
     """
     global _philter_instance
 
     if _philter_instance is None:
-        return []
+        return [], []
 
     texts_dict = {}
     record_map = {}
+    status_records = []
 
-    for bdsp_patient_id, bdsp_encounter_id, shifted_contact_date, text, de_id_filename in batch_data:
+    for note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date, text, de_id_filename in batch_data:
         if not text or len(str(text).strip()) == 0:
+            status_records.append((note_csn_id, str(de_id_filename), "skipped"))
             continue
 
         deid_key = str(de_id_filename)
         cleaned_text = keyword_removal.remove_keywords(str(text))
         texts_dict[deid_key] = cleaned_text
-        record_map[deid_key] = (bdsp_patient_id, bdsp_encounter_id, shifted_contact_date)
+        record_map[deid_key] = (note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date)
 
     if not texts_dict:
-        return []
+        return [], status_records
 
     # Clear ALL Philter state (including all_coords and coord2pattern which leaked memory)
     _philter_instance.include_map.map.clear()
@@ -180,9 +185,10 @@ def _process_batch(batch_data):
                     deid_key,
                     _philter_instance
                 )
-                bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
+                note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
                 results.append((bdsp_patient_id, bdsp_encounter_id,
                                 shifted_contact_date, deid_text, deid_key))
+                status_records.append((note_csn_id, deid_key, "deidentified"))
             except Exception as e1:
                 # Fallback to original method
                 try:
@@ -190,9 +196,10 @@ def _process_batch(batch_data):
                         texts_dict[deid_key],
                         deid_key
                     )
-                    bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
+                    note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
                     results.append((bdsp_patient_id, bdsp_encounter_id,
                                     shifted_contact_date, deid_text, deid_key))
+                    status_records.append((note_csn_id, deid_key, "deidentified"))
                 except Exception as e2:
                     logger.warning(f"Worker {os.getpid()}: Failed record {deid_key}: fast={e1}, fallback={e2}")
     except TimeoutError:
@@ -202,9 +209,10 @@ def _process_batch(batch_data):
         for deid_key in texts_dict.keys():
             try:
                 deid_text = re.sub(r'[a-zA-Z0-9]', '*', texts_dict[deid_key])
-                bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
+                note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
                 results.append((bdsp_patient_id, bdsp_encounter_id,
                                 shifted_contact_date, deid_text, deid_key))
+                status_records.append((note_csn_id, deid_key, "full_redaction"))
             except Exception:
                 pass
     except Exception as e:
@@ -231,7 +239,7 @@ def _process_batch(batch_data):
         _philter_instance.phi_type_dict[phi_type][0].coord2pattern.clear()
     gc.collect()
 
-    return results
+    return results, status_records
 
 
 def save_checkpoint(checkpoint_path, processed_count, batch_num, completed_files=None):
@@ -295,6 +303,18 @@ def write_parquet_batch(results, output_path, batch_num):
         pq.write_table(table, output_file, compression='snappy')
 
     logger.warning(f"  Wrote batch {batch_num}: {len(results)} records to {output_file}")
+
+
+def write_status_csv(status_records, output_path, partition_id):
+    """Append status records to the partition-level status CSV."""
+    csv_file = os.path.join(output_path, f"status_partition_{partition_id}.csv")
+    write_header = not os.path.exists(csv_file)
+
+    with open(csv_file, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(["NoteCSNID", "de_id_filename", "status"])
+        writer.writerows(status_records)
 
 
 def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None):
@@ -366,7 +386,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     # Verify schema from first remaining file
     first_table = pq.read_table(remaining_files[0])
     cols = first_table.column_names
-    required_cols = ['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'NoteTXT', 'de_id_filename']
+    required_cols = ['NoteCSNID', 'BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'NoteTXT', 'de_id_filename']
     missing = [c for c in required_cols if c not in cols]
     if missing:
         logger.error(f"Missing columns: {missing}")
@@ -394,9 +414,10 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
 
     # Chunked reading: read large files in 500K-row chunks to avoid 32GB+ memory spikes
     CHUNK_ROWS = 500000
-    NEED_COLS = ['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'NoteTXT', 'de_id_filename']
+    NEED_COLS = ['NoteCSNID', 'BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'NoteTXT', 'de_id_filename']
     SUB_BATCH_SIZE = 20
     WRITE_THRESHOLD = 100000  # Write every 100K results to cap memory
+    all_status_records = []
 
     for file_idx, parquet_file in enumerate(remaining_files):
         file_start_time = datetime.now()
@@ -431,6 +452,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
             logger.warning(f"  Chunk {chunk_num}/{num_chunks}: {chunk_records:,} records ({chunk_gb:.1f} GB)")
 
             file_data = list(zip(
+                df_chunk['NoteCSNID'].values,
                 df_chunk['BDSPPatientID'].values,
                 df_chunk['bdsp_encounter_id'].values,
                 df_chunk['ShiftedContactDate'].values,
@@ -445,8 +467,9 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
             sub_batches_done = 0
             progress_interval = max(1, min(100, len(worker_batches) // 10))
 
-            for result_list in pool.imap_unordered(_process_batch, worker_batches):
+            for result_list, status_list in pool.imap_unordered(_process_batch, worker_batches):
                 all_results.extend(result_list)
+                all_status_records.extend(status_list)
                 file_result_count += len(result_list)
                 sub_batches_done += 1
                 sub_batches_done_total += 1
@@ -465,6 +488,11 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
                     all_results = []
                     gc.collect()
 
+                # Flush status CSV periodically to avoid large in-memory accumulation
+                if len(all_status_records) >= WRITE_THRESHOLD:
+                    write_status_csv(all_status_records, output_path, partition_id)
+                    all_status_records = []
+
             del file_data
             del worker_batches
             gc.collect()
@@ -480,6 +508,11 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
             batch_num += 1
             write_parquet_batch(all_results, output_path, batch_num)
             all_results = []
+
+        # Flush remaining status records for this file
+        if all_status_records:
+            write_status_csv(all_status_records, output_path, partition_id)
+            all_status_records = []
 
         # Mark this file as completed in checkpoint
         completed_files.add(file_basename)
