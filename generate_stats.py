@@ -10,21 +10,27 @@ Output CSV columns:
   status          - "deidentified" or "not_deidentified"
 
 Usage:
-    # Local paths
+    # Single output partition
     python generate_stats.py \
-        --input-path ./input/ \
-        --output-path ./output/ \
-        --stats-file ./stats.csv
+        --input-path  s3://bucket/I0001_Notes/Notes_parquet_20/ \
+        --output-paths s3://bucket/output/partition_7/ \
+        --stats-file  ./stats.csv
 
-    # S3 paths
+    # Multiple output partitions for one input subfolder (comma-separated)
     python generate_stats.py \
-        --input-path s3://bdsp-site-mgb/I0001_Notes/Notes_parquet_20/ \
-        --output-path s3://bdsp-site-mgb/philter-deidentify/output/partition_7/ \
-        --stats-file ./stats.csv
+        --input-path  s3://bucket/I0001_Notes/Notes_parquet_18_19/ \
+        --output-paths s3://bucket/output/partition_3/,s3://bucket/output/partition_4/,s3://bucket/output/partition_5/,s3://bucket/output/partition_6/ \
+        --stats-file  ./stats.csv
+
+    # Append mode (for combining multiple subfolders into one file)
+    python generate_stats.py \
+        --input-path  s3://bucket/I0001_Notes/Notes_parquet_16_17/ \
+        --output-paths s3://bucket/output/partition_1/,s3://bucket/output/partition_2/ \
+        --stats-file  ./stats_all.csv \
+        --append
 """
 
 import pyarrow.parquet as pq
-import pyarrow as pa
 import pandas as pd
 import argparse
 import csv
@@ -63,43 +69,47 @@ def read_parquet_columns(filepath, columns):
         return pq.read_table(filepath, columns=columns).to_pandas()
 
 
-def build_output_set(output_path):
+def build_output_set(output_paths):
     """
-    Read all output parquet files and return the set of de_id_filename values
-    that were successfully written to output.
+    Read all output parquet files across one or more output paths.
+    Returns a set of de_id_filename values that appear in the output.
     """
-    output_files = list_parquet_files(output_path)
-    if not output_files:
-        logger.warning(f"No output parquet files found in {output_path}")
-        return set()
-
-    logger.info(f"Reading {len(output_files)} output file(s) to build de-identified set...")
     deid_keys = set()
-
-    for i, f in enumerate(output_files):
-        df = read_parquet_columns(f, ["de_id_filename"])
-        deid_keys.update(df["de_id_filename"].dropna().astype(str).tolist())
-        logger.info(f"  [{i+1}/{len(output_files)}] {os.path.basename(f)}: "
-                    f"{len(df):,} records — cumulative set size: {len(deid_keys):,}")
-        del df
+    for output_path in output_paths:
+        output_files = list_parquet_files(output_path)
+        if not output_files:
+            logger.warning(f"No output parquet files found in {output_path}")
+            continue
+        logger.info(f"  {output_path}: {len(output_files)} file(s)")
+        for f in output_files:
+            df = read_parquet_columns(f, ["de_id_filename"])
+            deid_keys.update(df["de_id_filename"].dropna().astype(str).tolist())
+            del df
 
     logger.info(f"Total unique de_id_filename in output: {len(deid_keys):,}")
     return deid_keys
 
 
-def generate_stats(input_path, output_path, stats_file):
+def generate_stats(input_path, output_paths, stats_file, append=False):
     """
     Compare input vs output and write stats CSV.
-    Streams input files one at a time to stay memory-safe.
+    Streams input files one at a time — memory-safe.
+    Uses vectorized pandas ops instead of iterrows for speed.
     """
-    # Step 1: Build set of de-identified keys from output
-    deid_keys = build_output_set(output_path)
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Input:   {input_path}")
+    logger.info(f"Outputs: {output_paths}")
+    logger.info(f"{'='*60}")
+
+    # Step 1: Build set of de-identified keys from all output paths
+    logger.info("Building de-identified key set from output...")
+    deid_keys = build_output_set(output_paths)
 
     # Step 2: Stream input files and write stats
     input_files = list_parquet_files(input_path)
     if not input_files:
         logger.error(f"No input parquet files found in {input_path}")
-        return
+        return 0, 0, 0
 
     logger.info(f"\nProcessing {len(input_files)} input file(s)...")
 
@@ -107,55 +117,59 @@ def generate_stats(input_path, output_path, stats_file):
     total_deidentified = 0
     total_not_deidentified = 0
 
-    with open(stats_file, "w", newline="") as csvf:
+    write_mode = "a" if append else "w"
+    write_header = not append or not os.path.exists(stats_file)
+
+    with open(stats_file, write_mode, newline="") as csvf:
         writer = csv.writer(csvf)
-        writer.writerow(["NoteCSNID", "de_id_filename", "status"])
+        if write_header:
+            writer.writerow(["NoteCSNID", "de_id_filename", "status"])
 
         for i, f in enumerate(input_files):
             logger.info(f"  [{i+1}/{len(input_files)}] {os.path.basename(f)}")
             df = read_parquet_columns(f, ["NoteCSNID", "de_id_filename"])
 
-            rows = []
-            for _, row in df.iterrows():
-                note_csn_id = row["NoteCSNID"]
-                de_id_fn = str(row["de_id_filename"]) if pd.notna(row["de_id_filename"]) else ""
-                status = "deidentified" if de_id_fn in deid_keys else "not_deidentified"
-                rows.append((note_csn_id, de_id_fn, status))
+            # Vectorized comparison — much faster than iterrows
+            df["de_id_filename"] = df["de_id_filename"].fillna("").astype(str)
+            df["status"] = df["de_id_filename"].apply(
+                lambda x: "deidentified" if x in deid_keys else "not_deidentified"
+            )
 
-            writer.writerows(rows)
+            writer.writerows(df[["NoteCSNID", "de_id_filename", "status"]].values.tolist())
 
-            file_deid = sum(1 for _, _, s in rows if s == "deidentified")
-            file_not = len(rows) - file_deid
-            total_deidentified += file_deid
+            file_deid = (df["status"] == "deidentified").sum()
+            file_not  = (df["status"] == "not_deidentified").sum()
+            total_deidentified    += file_deid
             total_not_deidentified += file_not
-            total_records += len(rows)
+            total_records         += len(df)
 
-            logger.info(f"    {len(rows):,} records — deidentified: {file_deid:,}, "
+            logger.info(f"    {len(df):,} records — deidentified: {file_deid:,}, "
                         f"not_deidentified: {file_not:,}")
             del df
 
-    # Summary
-    logger.info("\n" + "=" * 60)
-    logger.info("STATS SUMMARY")
-    logger.info("=" * 60)
-    logger.info(f"Total records:        {total_records:,}")
-    logger.info(f"Deidentified:         {total_deidentified:,} "
-                f"({100*total_deidentified/total_records:.1f}%)")
-    logger.info(f"Not deidentified:     {total_not_deidentified:,} "
-                f"({100*total_not_deidentified/total_records:.1f}%)")
-    logger.info(f"Stats file written:   {stats_file}")
-    logger.info("=" * 60)
+    logger.info(f"\n  Subfolder summary: {total_records:,} total, "
+                f"{total_deidentified:,} deidentified ({100*total_deidentified/max(total_records,1):.1f}%), "
+                f"{total_not_deidentified:,} not_deidentified")
+
+    return total_records, total_deidentified, total_not_deidentified
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate stats CSV from input/output parquet files")
-    parser.add_argument("--input-path",  required=True, help="S3 or local path to input parquet files")
-    parser.add_argument("--output-path", required=True, help="S3 or local path to output parquet files")
-    parser.add_argument("--stats-file",  required=True, help="Local path for the output stats CSV")
+    parser.add_argument("--input-path",   required=True,
+                        help="S3 or local path to input parquet files")
+    parser.add_argument("--output-paths", required=True,
+                        help="Comma-separated S3 or local paths to output parquet files")
+    parser.add_argument("--stats-file",   required=True,
+                        help="Local path for the output stats CSV")
+    parser.add_argument("--append",       action="store_true",
+                        help="Append to stats-file instead of overwriting")
     args = parser.parse_args()
 
+    output_paths = [p.strip() for p in args.output_paths.split(",")]
+
     start = datetime.now()
-    generate_stats(args.input_path, args.output_path, args.stats_file)
+    generate_stats(args.input_path, output_paths, args.stats_file, append=args.append)
     elapsed = (datetime.now() - start).total_seconds()
     logger.info(f"Done in {elapsed:.1f}s")
 
