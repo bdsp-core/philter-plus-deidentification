@@ -27,6 +27,7 @@ import os
 import json
 import re
 import gc
+import signal
 import boto3
 
 logging.basicConfig(
@@ -137,12 +138,18 @@ def _process_batch(batch_data):
     if not texts_dict:
         return []
 
-    # Clear Philter state
+    # Clear ALL Philter state (including all_coords and coord2pattern which leaked memory)
     _philter_instance.include_map.map.clear()
+    _philter_instance.include_map.all_coords.clear()
+    _philter_instance.include_map.coord2pattern.clear()
     _philter_instance.exclude_map.map.clear()
+    _philter_instance.exclude_map.all_coords.clear()
+    _philter_instance.exclude_map.coord2pattern.clear()
     _philter_instance.data_all_files.clear()
     for phi_type in _philter_instance.phi_type_list:
         _philter_instance.phi_type_dict[phi_type][0].map.clear()
+        _philter_instance.phi_type_dict[phi_type][0].all_coords.clear()
+        _philter_instance.phi_type_dict[phi_type][0].coord2pattern.clear()
 
     # Restore pattern data from cache (map_coordinates deletes "data" keys)
     # Reference assignment — map_coordinates only reads data then deletes the key,
@@ -152,10 +159,19 @@ def _process_batch(batch_data):
 
     results = []
 
+    # Timeout handler — prevents worker hang on pathological notes (regex backtracking)
+    def _alarm_handler(signum, frame):
+        raise TimeoutError("Batch timed out")
+
     try:
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(60)  # 60 second timeout per batch (normal batch takes ~2s)
+
         _philter_instance.texts = texts_dict
         _philter_instance.filenames = list(texts_dict.keys())
         _philter_instance.map_coordinates()
+
+        signal.alarm(0)  # cancel alarm — map_coordinates succeeded
 
         for deid_key in texts_dict.keys():
             try:
@@ -179,21 +195,40 @@ def _process_batch(batch_data):
                                     shifted_contact_date, deid_text, deid_key))
                 except Exception as e2:
                     logger.warning(f"Worker {os.getpid()}: Failed record {deid_key}: fast={e1}, fallback={e2}")
+    except TimeoutError:
+        signal.alarm(0)
+        logger.warning(f"Worker {os.getpid()}: TIMEOUT — batch of {len(texts_dict)} records falling back to full redaction")
+        # Fallback: fully redact all alphanumeric — safe, fast, no records lost
+        for deid_key in texts_dict.keys():
+            try:
+                deid_text = re.sub(r'[a-zA-Z0-9]', '*', texts_dict[deid_key])
+                bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
+                results.append((bdsp_patient_id, bdsp_encounter_id,
+                                shifted_contact_date, deid_text, deid_key))
+            except Exception:
+                pass
     except Exception as e:
+        signal.alarm(0)
         logger.error(f"Worker {os.getpid()}: map_coordinates failed for {len(texts_dict)} texts: {e}")
         import traceback
         traceback.print_exc()
 
-    # Explicitly clear large objects and force garbage collection to prevent memory growth
+    # Explicitly clear ALL large objects and force garbage collection to prevent memory growth
     texts_dict.clear()
     record_map.clear()
     _philter_instance.include_map.map.clear()
+    _philter_instance.include_map.all_coords.clear()
+    _philter_instance.include_map.coord2pattern.clear()
     _philter_instance.exclude_map.map.clear()
+    _philter_instance.exclude_map.all_coords.clear()
+    _philter_instance.exclude_map.coord2pattern.clear()
     _philter_instance.data_all_files.clear()
     _philter_instance.texts.clear()
     _philter_instance.filenames.clear()
     for phi_type in _philter_instance.phi_type_list:
         _philter_instance.phi_type_dict[phi_type][0].map.clear()
+        _philter_instance.phi_type_dict[phi_type][0].all_coords.clear()
+        _philter_instance.phi_type_dict[phi_type][0].coord2pattern.clear()
     gc.collect()
 
     return results
@@ -344,7 +379,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     logger.warning(f"\nInitializing {num_workers} workers...")
     init_start = datetime.now()
     pool = Pool(processes=num_workers, initializer=_init_worker, initargs=(philter_config,),
-                maxtasksperchild=3)
+                maxtasksperchild=50)
     init_elapsed = (datetime.now() - init_start).total_seconds()
     logger.warning(f"✓ Workers ready in {init_elapsed:.1f}s")
 
@@ -357,61 +392,92 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     all_results = []
     total_records = 0
 
+    # Chunked reading: read large files in 500K-row chunks to avoid 32GB+ memory spikes
+    CHUNK_ROWS = 500000
+    NEED_COLS = ['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'NoteTXT', 'de_id_filename']
+    SUB_BATCH_SIZE = 20
+    WRITE_THRESHOLD = 100000  # Write every 100K results to cap memory
+
     for file_idx, parquet_file in enumerate(remaining_files):
-        file_start = datetime.now()
+        file_start_time = datetime.now()
         file_basename = os.path.basename(parquet_file)
         logger.warning(f"\n--- File {file_idx+1}/{len(remaining_files)}: {file_basename} ---")
 
-        table = pq.read_table(parquet_file)
-        df = table.to_pandas()
-        del table
+        # Open file handle for chunked reading
+        if parquet_file.startswith('s3://'):
+            import s3fs
+            _fs = s3fs.S3FileSystem()
+            _fh = _fs.open(parquet_file)
+            pf = pq.ParquetFile(_fh)
+        else:
+            _fh = None
+            pf = pq.ParquetFile(parquet_file)
 
-        file_records = len(df)
+        file_records = pf.metadata.num_rows
         total_records += file_records
-        logger.warning(f"  Loaded {file_records:,} records ({df.memory_usage(deep=True).sum() / 1024**3:.1f} GB)")
+        num_chunks = (file_records + CHUNK_ROWS - 1) // CHUNK_ROWS
+        logger.warning(f"  File has {file_records:,} records, reading in {num_chunks} chunk(s) of {CHUNK_ROWS:,}")
 
-        # Vectorized extraction (100x faster than iterrows)
-        file_data = list(zip(
-            df['BDSPPatientID'].values,
-            df['bdsp_encounter_id'].values,
-            df['ShiftedContactDate'].values,
-            df['NoteTXT'].values,
-            df['de_id_filename'].values
-        ))
-        del df  # Free dataframe memory early
-
-        # Split entire file into small sub-batches for dynamic scheduling
-        # Small sub-batches (200 records) prevent straggler workers from blocking others
-        # Processing entire file at once keeps all workers busy (no idle time between batches)
-        sub_batch_size = 200
-        worker_batches = [file_data[j:j+sub_batch_size]
-                          for j in range(0, len(file_data), sub_batch_size)]
-        logger.warning(f"  Split into {len(worker_batches)} sub-batches of {sub_batch_size} records")
-
-        # Process with dynamic scheduling — fast workers grab next chunk immediately
         file_result_count = 0
-        sub_batches_done = 0
-        progress_interval = max(1, len(worker_batches) // 10)  # Log ~10 times per file
+        total_sub_batches = (file_records + SUB_BATCH_SIZE - 1) // SUB_BATCH_SIZE
+        sub_batches_done_total = 0
+        chunk_num = 0
 
-        for result_list in pool.imap_unordered(_process_batch, worker_batches):
-            all_results.extend(result_list)
-            file_result_count += len(result_list)
-            sub_batches_done += 1
+        for record_batch in pf.iter_batches(batch_size=CHUNK_ROWS, columns=NEED_COLS):
+            chunk_num += 1
+            df_chunk = record_batch.to_pandas()
+            chunk_records = len(df_chunk)
+            chunk_gb = df_chunk.memory_usage(deep=True).sum() / 1024**3
+            logger.warning(f"  Chunk {chunk_num}/{num_chunks}: {chunk_records:,} records ({chunk_gb:.1f} GB)")
 
-            # Log progress periodically
-            if sub_batches_done % progress_interval == 0 or sub_batches_done == len(worker_batches):
-                elapsed_file = (datetime.now() - file_start).total_seconds()
-                rate = (sub_batches_done * sub_batch_size) / elapsed_file if elapsed_file > 0 else 0
-                pct = 100 * sub_batches_done / len(worker_batches)
-                logger.warning(f"  Progress: {sub_batches_done}/{len(worker_batches)} sub-batches ({pct:.0f}%), "
-                               f"{file_result_count:,} output, {rate:.1f} rec/sec")
+            file_data = list(zip(
+                df_chunk['BDSPPatientID'].values,
+                df_chunk['bdsp_encounter_id'].values,
+                df_chunk['ShiftedContactDate'].values,
+                df_chunk['NoteTXT'].values,
+                df_chunk['de_id_filename'].values
+            ))
+            del df_chunk
+
+            worker_batches = [file_data[j:j+SUB_BATCH_SIZE]
+                              for j in range(0, len(file_data), SUB_BATCH_SIZE)]
+
+            sub_batches_done = 0
+            progress_interval = max(1, min(100, len(worker_batches) // 10))
+
+            for result_list in pool.imap_unordered(_process_batch, worker_batches):
+                all_results.extend(result_list)
+                file_result_count += len(result_list)
+                sub_batches_done += 1
+                sub_batches_done_total += 1
+
+                if sub_batches_done % progress_interval == 0 or sub_batches_done == len(worker_batches):
+                    elapsed_file = (datetime.now() - file_start_time).total_seconds()
+                    rate = file_result_count / elapsed_file if elapsed_file > 0 else 0
+                    pct = 100 * sub_batches_done_total / total_sub_batches
+                    logger.warning(f"  Progress: {sub_batches_done_total}/{total_sub_batches} sub-batches ({pct:.0f}%), "
+                                   f"{file_result_count:,} output, {rate:.1f} rec/sec")
+
+                # Intermediate write to cap memory
+                if len(all_results) >= WRITE_THRESHOLD:
+                    batch_num += 1
+                    write_parquet_batch(all_results, output_path, batch_num)
+                    all_results = []
+                    gc.collect()
+
+            del file_data
+            del worker_batches
+            gc.collect()
+
+        # Close S3 file handle
+        if _fh is not None:
+            _fh.close()
 
         total_processed += file_records
-        batch_num += 1
-        del file_data
 
-        # Write output after EACH file (not every 100K) — crash-safe
+        # Write remaining results for this file
         if all_results:
+            batch_num += 1
             write_parquet_batch(all_results, output_path, batch_num)
             all_results = []
 
@@ -419,7 +485,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         completed_files.add(file_basename)
         save_checkpoint(output_path, total_processed, batch_num, list(completed_files))
 
-        file_elapsed = (datetime.now() - file_start).total_seconds()
+        file_elapsed = (datetime.now() - file_start_time).total_seconds()
 
         # Progress update
         elapsed = (datetime.now() - process_start).total_seconds()
