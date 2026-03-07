@@ -63,14 +63,19 @@ def read_parquet_columns(filepath, columns):
         return pq.read_table(filepath, columns=columns).to_pandas()
 
 
-def read_full_parquet(filepath):
+def iter_parquet_batches(filepath, batch_size=100_000):
+    """Iterate over a parquet file in batches to avoid loading it all into memory."""
     if filepath.startswith("s3://"):
         import s3fs
         fs = s3fs.S3FileSystem()
         with fs.open(filepath) as f:
-            return pq.read_table(f).to_pandas()
+            pf = pq.ParquetFile(f)
+            for batch in pf.iter_batches(batch_size=batch_size):
+                yield batch.to_pandas()
     else:
-        return pq.read_table(filepath).to_pandas()
+        pf = pq.ParquetFile(filepath)
+        for batch in pf.iter_batches(batch_size=batch_size):
+            yield batch.to_pandas()
 
 
 def write_parquet(df, filepath):
@@ -129,47 +134,55 @@ def extract_not_deidentified(input_path, output_paths, rerun_path, dry_run=False
 
     for i, f in enumerate(input_files):
         logger.info(f"  [{i+1}/{len(input_files)}] {os.path.basename(f)}")
-        df = read_full_parquet(f)
-        total_records += len(df)
+        file_not_deid = 0
 
-        # Filter to not-deidentified records
-        df["de_id_filename"] = df["de_id_filename"].fillna("").astype(str)
-        mask = ~df["de_id_filename"].isin(deid_keys)
-        not_deid_df = df[mask].copy()
-        del df
+        try:
+            # Read in batches to avoid loading full file into memory
+            for df in iter_parquet_batches(f):
+                total_records += len(df)
 
-        count = len(not_deid_df)
-        total_not_deid += count
-        logger.info(f"    {count:,} not-deidentified records")
+                df["de_id_filename"] = df["de_id_filename"].fillna("").astype(str)
+                mask = ~df["de_id_filename"].isin(deid_keys)
+                not_deid_df = df[mask].copy()
+                del df
 
-        if count == 0 or dry_run:
-            del not_deid_df
-            continue
+                count = len(not_deid_df)
+                file_not_deid += count
+                total_not_deid += count
 
-        buffer.append(not_deid_df)
-        buffer_rows += count
+                if count == 0 or dry_run:
+                    del not_deid_df
+                    continue
 
-        # Write when buffer reaches ROWS_PER_FILE
-        while buffer_rows >= ROWS_PER_FILE:
-            combined = pd.concat(buffer, ignore_index=True)
-            buffer = []
-            buffer_rows = 0
+                buffer.append(not_deid_df)
+                buffer_rows += count
 
-            chunk = combined.iloc[:ROWS_PER_FILE]
-            remainder = combined.iloc[ROWS_PER_FILE:]
+                # Write when buffer reaches ROWS_PER_FILE
+                while buffer_rows >= ROWS_PER_FILE:
+                    combined = pd.concat(buffer, ignore_index=True)
+                    buffer = []
+                    buffer_rows = 0
 
-            file_counter += 1
-            out_path = f"{rerun_path.rstrip('/')}/part_{file_counter:05d}.parquet"
-            write_parquet(chunk, out_path)
-            logger.info(f"    Wrote {out_path} ({len(chunk):,} rows)")
+                    chunk = combined.iloc[:ROWS_PER_FILE]
+                    remainder = combined.iloc[ROWS_PER_FILE:]
 
-            if len(remainder) > 0:
-                buffer.append(remainder)
-                buffer_rows = len(remainder)
+                    file_counter += 1
+                    out_path = f"{rerun_path.rstrip('/')}/part_{file_counter:05d}.parquet"
+                    write_parquet(chunk, out_path)
+                    logger.info(f"    Wrote {out_path} ({len(chunk):,} rows)")
 
-            del combined, chunk, remainder
+                    if len(remainder) > 0:
+                        buffer.append(remainder)
+                        buffer_rows = len(remainder)
 
-        del not_deid_df
+                    del combined, chunk, remainder
+
+                del not_deid_df
+
+        except Exception as e:
+            logger.error(f"    ERROR reading {os.path.basename(f)}: {e} — skipping file")
+
+        logger.info(f"    {file_not_deid:,} not-deidentified records")
 
     # Flush remaining buffer
     if buffer and not dry_run:

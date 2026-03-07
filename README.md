@@ -1,58 +1,77 @@
 # Philter De-identification Pipeline
 
-De-identifies clinical notes (free text) stored as Parquet files in AWS S3 using the **Philter** NLP engine. Built to process **500+ million medical records** across multiple EC2 instances in parallel.
+De-identifies clinical notes and imaging reports stored as Parquet files in AWS S3, using the **Philter** NLP engine. Built to process **600+ million medical records** across multiple EC2 instances in parallel — reading directly from S3 and writing back to S3 with no local disk staging.
 
 ---
 
 ## Table of Contents
 
+- [Project Status](#project-status)
 - [How It Works](#how-it-works)
 - [Input / Output Schema](#input--output-schema)
+- [S3 Layout](#s3-layout)
 - [Prerequisites](#prerequisites)
-- [Local Setup](#local-setup)
-- [Testing on EC2](#testing-on-ec2)
-- [Production Deployment](#production-deployment)
-- [Monitoring](#monitoring)
-- [Cost Estimate](#cost-estimate)
+- [Step-by-Step Manual Execution Guide](#step-by-step-manual-execution-guide)
+  - [1. Create EC2 Instances](#1-create-ec2-instances)
+  - [2. Configure IAM Role](#2-configure-iam-role)
+  - [3. Deploy and Run](#3-deploy-and-run)
+  - [4. Monitor Progress](#4-monitor-progress)
+  - [5. Verify and Generate Stats](#5-verify-and-generate-stats)
+- [Deploy Scripts Reference](#deploy-scripts-reference)
+- [Architecture: Key Design Decisions](#architecture-key-design-decisions)
+- [Monitoring Reference](#monitoring-reference)
+- [Cost Estimates](#cost-estimates)
 - [File Reference](#file-reference)
+- [Local Setup](#local-setup)
+
+---
+
+## Project Status
+
+| Dataset | Records | Status | Output Path |
+|---------|---------|--------|-------------|
+| Clinical Notes (original) | ~512M | **Done** (~74.6M missed due to SSO expiry) | `philter-deidentify/output/` |
+| Imaging Reports | ~47.6M | **Complete** | `philter-deidentify/imaging_output/partition_{0-19}/` |
+| Missed Clinical Notes | ~108.8M | **In progress** | `philter-deidentify/missed_notes_output/partition_{0-19}/` |
 
 ---
 
 ## How It Works
 
-The de-identification pipeline has two stages applied to each clinical note:
+The de-identification pipeline applies two stages to each note:
 
 1. **Keyword Removal** (`keyword_removal.py`) — Regex-based removal of ~250 site-specific identifiers (hospital names, addresses, MRNs, abbreviations). Replaces matches with `*****`.
-2. **Philter NLP** (`philter.py`) — 330 regex patterns + NLTK POS tagging (Named Entity Recognition) to detect and redact PHI such as patient names, dates, phone numbers, SSNs, locations, etc. Uses config from `configs/philter_one.json`.
+2. **Philter NLP** (`philter.py`) — 330 regex patterns + NLTK POS tagging to detect and redact PHI (patient names, dates, phone numbers, SSNs, locations, etc.). Config from `configs/philter_one.json`.
 
 Processing flow:
 ```
-S3 Parquet Input → Read batches → keyword_removal → Philter NLP → Write de-identified Parquet to S3
+S3 Parquet Input
+  → Read in batches
+  → keyword_removal (regex PHI scrub)
+  → Philter NLP (330 patterns + NER)
+  → Write de-identified Parquet back to S3
 ```
 
-Each EC2 instance runs 30 parallel workers using Python's `multiprocessing.Pool` with `imap_unordered` for dynamic scheduling. Checkpoints are saved after each file for crash-safe resume on interruption.
+Each EC2 instance runs **60 parallel workers** via `multiprocessing.Pool` with `imap_unordered`. A **watchdog script** wraps the Python process and auto-restarts it on crash. Checkpoints are saved to S3 after each file for crash-safe resume.
 
 ---
 
 ## Input / Output Schema
 
-### Input (Parquet files in S3)
+### Clinical Notes (`--note-type clinicalnotes`)
+
+**Input columns (from S3):**
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `NoteCSNID` | string | Note CSN identifier |
 | `BDSPPatientID` | int32 | BDSP patient identifier |
-| `PMRNID` | string | PMR number |
-| `PatientEncounterID` | string | Encounter identifier |
-| `ShiftedDays` | int32 | Date shift offset |
 | `bdsp_encounter_id` | int64 | BDSP encounter identifier |
-| `sum` | int64 | Sum field |
 | `ShiftedContactDate` | string | Date-shifted contact date |
-| `ShiftedContactYear` | int32 | Date-shifted year |
 | `NoteTXT` | string | **Clinical note text (to be de-identified)** |
 | `de_id_filename` | string | Filename key used by Philter |
 
-### Output (Parquet files written to S3)
+**Output columns:**
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -62,64 +81,565 @@ Each EC2 instance runs 30 parallel workers using Python's `multiprocessing.Pool`
 | `NoteTXT` | string | **De-identified clinical note text** |
 | `de_id_filename` | string | Filename key |
 
+### Imaging Reports (`--note-type imagingreport`)
+
+**Input columns (from S3):**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `OrderProcedureID` | decimal128 | Order procedure identifier |
+| `BDSPPatientID` | int32 | BDSP patient identifier |
+| `bdsp_encounter_id` | int64 | BDSP encounter identifier |
+| `ShiftedContactDate` | string | Date-shifted contact date |
+| `ReportTXT` | string | **Imaging report text (to be de-identified)** |
+| `de_id_filename` | string | Filename key used by Philter |
+
+**Output columns:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `BDSPPatientID` | int32 | BDSP patient identifier |
+| `bdsp_encounter_id` | int64 | BDSP encounter identifier |
+| `ShiftedContactDate` | string | Date-shifted contact date |
+| `ReportTXT` | string | **De-identified imaging report text** |
+| `de_id_filename` | string | Filename key |
+
+---
+
+## S3 Layout
+
+```
+s3://bdsp-site-mgb/
+├── I0001_Notes/                                    ← INPUT: original clinical notes (8 subfolders)
+│   ├── Notes_parquet_15_and_before/
+│   ├── Notes_parquet_16_17/
+│   ├── Notes_parquet_18_19/
+│   ├── Notes_parquet_20/
+│   ├── Notes_parquet_21/
+│   ├── Notes_parquet_22/
+│   ├── Notes_parquet_23/
+│   └── Notes_parquet_24/
+├── I0001_ImagingReports/                           ← INPUT: imaging reports (96 files flat)
+├── I0001_ClinicalNotes_Missed/                     ← INPUT: missed clinical notes (200 files flat)
+└── philter-deidentify/
+    ├── config/philter_one.json                     ← Philter config (uploaded by deploy scripts)
+    ├── output/                                     ← Clinical notes output (original run)
+    ├── imaging_output/
+    │   ├── partition_0/                            ← Imaging report output (20 partitions)
+    │   │   ├── batch_000001.parquet
+    │   │   ├── batch_000002.parquet
+    │   │   └── checkpoint.json
+    │   ├── partition_1/ ... partition_19/
+    │   └── logs/partition_X_complete.log           ← Completion markers
+    └── missed_notes_output/
+        ├── partition_0/                            ← Missed notes output (20 partitions)
+        │   ├── batch_000001.parquet
+        │   └── checkpoint.json
+        ├── partition_1/ ... partition_19/
+        └── logs/partition_X_complete.log
+```
+
 ---
 
 ## Prerequisites
 
-Before running any scripts, you need:
+### AWS Setup
 
-### 1. AWS Credentials
+1. **AWS CLI** installed and configured locally with the `bidmc` profile:
+   ```bash
+   aws configure --profile bidmc
+   # Enter: Access Key ID, Secret Access Key, region=us-east-1, output=json
+   ```
 
-A configured AWS profile (`bidmc`) in `~/.aws/credentials`:
+2. **`bidmc` profile** must have permissions to:
+   - `ec2:DescribeInstances` (to get instance IPs)
+   - `s3:GetObject` / `s3:PutObject` on `s3://bdsp-site-mgb/`
 
-```ini
-[bidmc]
-aws_access_key_id = YOUR_KEY
-aws_secret_access_key = YOUR_SECRET
-aws_session_token = YOUR_TOKEN
+3. **SSH key** (`philter.pem`) with `chmod 400`:
+   ```bash
+   chmod 400 /Users/anjanarayapureddy/Desktop/Philter/philter.pem
+   ```
+
+4. **Security group** on instances must allow **SSH (port 22)** from your IP:
+   ```bash
+   MY_IP=$(curl -s https://checkip.amazonaws.com)
+   aws ec2 authorize-security-group-ingress \
+       --profile bidmc --region us-east-1 \
+       --group-id <SG_ID> \
+       --protocol tcp --port 22 --cidr ${MY_IP}/32
+   ```
+
+### Local Dependencies (for stats/verification only)
+
+```bash
+pip install boto3 pandas pyarrow s3fs
 ```
 
-### 2. EC2 Instances (must be running before deployment)
+---
 
-The scripts **do not create** EC2 instances. You must create them manually in the AWS Console:
+## Step-by-Step Manual Execution Guide
+
+This section explains how to run the pipeline from scratch without any automation tooling.
+
+### 1. Create EC2 Instances
+
+In the **AWS Console** (or via AWS CLI), create N instances with these settings:
 
 | Setting | Value |
 |---------|-------|
-| **AMI** | Amazon Linux 2 (x86_64) |
-| **Instance Type** | `t3.micro` (test) or `c6i.16xlarge` (production) |
-| **Key Pair** | Your PEM key |
-| **VPC** | `vpc-0b19ba4d16f0f4695` |
-| **Subnet** | `subnet-032f4ed8e15acf550` (public, us-east-1a) |
-| **Security Group** | `sg-0350d41bfbbc1f0b6` (launch-wizard-20) |
-| **Auto-assign Public IP** | Enabled |
-| **Storage** | 200 GB gp3 (production), 8 GB (test) |
+| AMI | Amazon Linux 2 (x86_64, `amzn2-ami-hvm-*`) |
+| Instance type | `c6i.16xlarge` (64 vCPU, 128 GB RAM) |
+| Pricing | **Spot** (~$0.68/hr, significant savings) |
+| Storage | 50 GB gp3 (no local data needed — S3-direct) |
+| IAM Instance Profile | `AmazonSSMRoleForInstancesQuickSetup` ← **critical** |
+| Key pair | Your PEM file |
+| Auto-assign public IP | Enabled |
+| Security group | Must allow SSH (port 22) from your IP |
 
-### 3. PEM File
-
-- PEM file with `chmod 400` permissions
-- Security group must have **SSH (port 22)** open for your IP
-
+**Via AWS CLI (example for 20 instances):**
 ```bash
-# Set correct permissions
-chmod 400 /path/to/your-key.pem
-
-# Add your IP to the security group
-MY_IP=$(curl -s https://checkip.amazonaws.com)
-aws ec2 authorize-security-group-ingress \
+aws ec2 run-instances \
     --profile bidmc --region us-east-1 \
-    --group-id sg-0350d41bfbbc1f0b6 \
-    --protocol tcp --port 22 --cidr ${MY_IP}/32
+    --image-id ami-xxxxxxxxxxxxxxxxx \
+    --count 20 \
+    --instance-type c6i.16xlarge \
+    --key-name your-key-name \
+    --iam-instance-profile Name=AmazonSSMRoleForInstancesQuickSetup \
+    --instance-market-options '{"MarketType":"spot"}' \
+    --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":50,"VolumeType":"gp3"}}]' \
+    --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=philter-worker}]'
 ```
 
-### 4. S3 Access
+Wait for all instances to reach `running` state:
+```bash
+aws ec2 describe-instances \
+    --profile bidmc --region us-east-1 \
+    --filters "Name=tag:Name,Values=philter-worker" "Name=instance-state-name,Values=running" \
+    --query 'Reservations[*].Instances[*].[InstanceId,PublicIpAddress]' \
+    --output text
+```
 
-The `bidmc` profile must have read/write access to:
-- `s3://bdsp-site-mgb/I0001_Notes/` (input - read only)
-- `s3://bdsp-site-mgb/philter-deidentify/` (output - read/write)
+### 2. Configure IAM Role
+
+The IAM instance profile `AmazonSSMRoleForInstancesQuickSetup` must be attached to all instances. This grants boto3 automatic, non-expiring S3 access via the instance metadata service (IMDS). **No credentials file is needed or wanted on the instance.**
+
+> **Why this matters**: Previous runs used SSO credentials written to `~/.aws/credentials` on each instance. These expired after 12 hours, silently causing all S3 writes to fail mid-run. The IAM role has no expiry.
+
+If the role isn't attached at launch, attach it via the console: *EC2 → Instance → Actions → Security → Modify IAM Role*.
+
+### 3. Deploy and Run
+
+Each deploy script handles everything automatically: packages the code, uploads to S3, SSH's into each instance sequentially, installs dependencies, and starts a watchdog process.
+
+**For a new dataset run, use the appropriate script:**
+
+```bash
+# Missed clinical notes (most recent run)
+./deploy_missed_notes.sh i-0aaa... i-0bbb... i-0ccc...   # pass all instance IDs
+
+# Imaging reports
+./deploy_imaging.sh i-0aaa... i-0bbb...
+
+# Original clinical notes
+./deploy_aws.sh i-0aaa... i-0bbb...
+```
+
+**What the deploy script does per instance (in order):**
+
+1. Packages the project into a tarball and uploads it to S3 (done once, shared by all instances)
+2. SSHs into the instance
+3. Removes any stale AWS credentials (`rm -f ~/.aws/credentials`) so the IAM role takes effect
+4. Downloads and extracts the project tarball from S3
+5. Installs Python dependencies (`pyarrow`, `pandas`, `boto3`, `s3fs`, `nltk`)
+6. Writes a `start_watchdog.sh` script that wraps the Python process in a restart loop
+7. Starts the watchdog via `nohup` as a detached background process
+
+**The watchdog loop (how crash recovery works):**
+
+```bash
+while true; do
+    python3.9 process_parquet_aws.py \
+        --input-path  "s3://bdsp-site-mgb/I0001_ClinicalNotes_Missed/" \
+        --output-path "s3://bdsp-site-mgb/philter-deidentify/missed_notes_output/partition_N/" \
+        --partition-id N \
+        --workers 60 \
+        --file-start FILE_START \
+        --file-end   FILE_END \
+        --note-type  clinicalnotes \
+        --philter-config configs/philter_one.json
+    EXIT=$?
+    [ $EXIT -eq 0 ] && break           # clean exit = done
+    echo "$(date): crashed (exit $EXIT), restarting in 10s..."
+    sleep 10
+done
+```
+
+If the process crashes (OOM, spot interruption, network error), the watchdog restarts it automatically. On restart, `process_parquet_aws.py` reads `checkpoint.json` from S3 and skips already-completed files.
+
+**To run manually on a single instance (without the deploy script):**
+
+```bash
+# SSH in
+ssh -i /path/to/philter.pem ec2-user@<instance-ip>
+
+# Install deps (if not already installed)
+sudo yum install -y python39 python39-pip git
+pip3.9 install pyarrow pandas boto3 s3fs nltk
+python3.9 -c "import nltk; nltk.download('averaged_perceptron_tagger'); nltk.download('averaged_perceptron_tagger_eng'); nltk.download('punkt'); nltk.download('punkt_tab')"
+
+# Clear stale credentials (IAM role must be used instead)
+rm -f ~/.aws/credentials
+
+# Clone the repo
+git clone -b AWS_Integration https://github.com/your-org/philter-plus-deidentification.git
+cd philter-plus-deidentification
+
+# Run directly (no watchdog — you'll need to restart manually on crash)
+python3.9 process_parquet_aws.py \
+    --input-path  "s3://bdsp-site-mgb/I0001_ClinicalNotes_Missed/" \
+    --output-path "s3://bdsp-site-mgb/philter-deidentify/missed_notes_output/partition_0/" \
+    --partition-id 0 \
+    --workers 60 \
+    --file-start 0 \
+    --file-end 10 \
+    --note-type clinicalnotes \
+    --philter-config configs/philter_one.json
+
+# OR: run with watchdog for auto-restart
+nohup bash start_watchdog.sh > ~/deidentify.log 2>&1 &
+disown
+```
+
+**`process_parquet_aws.py` argument reference:**
+
+| Argument | Description | Example |
+|----------|-------------|---------|
+| `--input-path` | S3 prefix to read Parquet files from | `s3://bdsp-site-mgb/I0001_ClinicalNotes_Missed/` |
+| `--output-path` | S3 prefix to write output Parquet files to | `s3://bdsp-site-mgb/.../partition_0/` |
+| `--partition-id` | Integer ID for this partition (used in logs/completion markers) | `0` |
+| `--workers` | Number of parallel multiprocessing workers | `60` |
+| `--batch-size` | Records per sub-batch sent to workers | `10000` |
+| `--file-start` | Index of first file to process (0-based, inclusive) | `0` |
+| `--file-end` | Index of last file to process (exclusive) | `10` |
+| `--note-type` | `clinicalnotes` (NoteTXT/NoteCSNID) or `imagingreport` (ReportTXT/OrderProcedureID) | `clinicalnotes` |
+| `--philter-config` | Path to Philter JSON config | `configs/philter_one.json` |
+
+### 4. Monitor Progress
+
+**Check if watchdog is running (via SSH):**
+```bash
+KEY="/Users/anjanarayapureddy/Desktop/Philter/philter.pem"
+IP="<instance-ip>"
+
+ssh -o StrictHostKeyChecking=no -i $KEY ec2-user@$IP \
+    'ps aux | grep start_watchdog | grep -v grep | wc -l'
+# Should print 1
+```
+
+**Tail the log for live progress:**
+```bash
+ssh -i $KEY ec2-user@$IP 'tail -f ~/deidentify.log'
+```
+
+Expected log output:
+```
+--- File 3/10: part-00003.parquet ---
+  Loaded 543,812 records
+  Split into 55 sub-batches of 10000 records
+  Progress: 27/55 sub-batches (49%), 269,443 output, 123.4 rec/sec
+  Progress: 55/55 sub-batches (100%), 542,907 output, 121.8 rec/sec
+  Wrote batch 3: 542907 records
+  File done in 74.5 min
+  Progress: 3/10 files, 1,621,432 records, 122.1 rec/sec
+```
+
+**Check all 20 instances at once (speed + watchdog count):**
+```bash
+KEY="/Users/anjanarayapureddy/Desktop/Philter/philter.pem"
+declare -A IPS=(
+    [0]="<ip0>" [1]="<ip1>" [2]="<ip2>" [3]="<ip3>" [4]="<ip4>"
+    # ... add all IPs
+)
+for i in "${!IPS[@]}"; do
+    IP="${IPS[$i]}"
+    RESULT=$(ssh -o StrictHostKeyChecking=no -i $KEY ec2-user@$IP \
+        "WC=\$(ps aux | grep start_watchdog | grep -v grep | wc -l); \
+         RATE=\$(grep 'rec/sec' ~/deidentify.log 2>/dev/null | tail -1 | grep -oP '[0-9]+\.[0-9]+ rec/sec'); \
+         echo 'P${i}: watchdogs='\$WC' | '\$RATE" 2>/dev/null)
+    echo "$RESULT"
+done
+```
+
+**Count output files in S3 per partition:**
+```bash
+for i in $(seq 0 19); do
+    COUNT=$(aws s3 --profile bidmc ls \
+        s3://bdsp-site-mgb/philter-deidentify/missed_notes_output/partition_${i}/ 2>/dev/null \
+        | grep -c parquet || echo 0)
+    echo "Partition $i: $COUNT files"
+done
+```
+
+**Check completion logs (one per partition when done):**
+```bash
+aws s3 --profile bidmc ls s3://bdsp-site-mgb/philter-deidentify/missed_notes_output/logs/
+# When all 20 partitions appear here, the run is complete
+```
+
+**Check checkpoint progress for one partition:**
+```bash
+aws s3 --profile bidmc cp \
+    s3://bdsp-site-mgb/philter-deidentify/missed_notes_output/partition_0/checkpoint.json - \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Files done: {len(d[\"completed_files\"])}, Records: {d[\"processed_count\"]:,}')"
+```
+
+### 5. Verify and Generate Stats
+
+After all completion logs appear, run `generate_stats.py` locally to verify coverage:
+
+```bash
+# For missed clinical notes
+python3 generate_stats.py \
+    --input-path s3://bdsp-site-mgb/I0001_ClinicalNotes_Missed/ \
+    --output-paths s3://bdsp-site-mgb/philter-deidentify/missed_notes_output/partition_0/,partition_1/,...,partition_19/ \
+    --stats-file ./missed_notes_stats.csv \
+    --note-type clinicalnotes \
+    --profile bidmc
+
+# For imaging reports
+python3 generate_stats.py \
+    --input-path s3://bdsp-site-mgb/I0001_ImagingReports/ \
+    --output-paths s3://bdsp-site-mgb/philter-deidentify/imaging_output/partition_0/,...,partition_19/ \
+    --stats-file ./imaging_stats.csv \
+    --note-type imagingreport \
+    --profile bidmc
+```
+
+Expected: ≥99% records de-identified, output `ReportTXT`/`NoteTXT` contains `*` characters.
+
+---
+
+## Deploy Scripts Reference
+
+### `deploy_missed_notes.sh` — Missed Clinical Notes
+
+Deploys to N instances for processing `I0001_ClinicalNotes_Missed/` (200 files × ~544K rows = ~108.8M records).
+
+```bash
+./deploy_missed_notes.sh i-0aaa... i-0bbb... [more instance IDs...]
+```
+
+Key config inside the script:
+```bash
+BUCKET="bdsp-site-mgb"
+INPUT_PREFIX="I0001_ClinicalNotes_Missed/"
+OUTPUT_PREFIX="philter-deidentify/missed_notes_output"
+NUM_WORKERS=60
+TOTAL_FILES=200
+NOTE_TYPE="clinicalnotes"
+```
+
+File range split: `200 files / N instances`, one range per instance. With 20 instances = 10 files each.
+
+---
+
+### `deploy_imaging.sh` — Imaging Reports
+
+Deploys to N instances for processing `I0001_ImagingReports/` (96 files × ~496K rows = ~47.6M records).
+
+```bash
+./deploy_imaging.sh i-0aaa... i-0bbb... [more instance IDs...]
+```
+
+Key config:
+```bash
+BUCKET="bdsp-site-mgb"
+INPUT_PREFIX="I0001_ImagingReports/"
+OUTPUT_PREFIX="philter-deidentify/imaging_output"
+NUM_WORKERS=60
+TOTAL_FILES=96
+NOTE_TYPE="imagingreport"
+```
+
+---
+
+### `deploy_aws.sh` — Original Clinical Notes
+
+Deploys to N instances for processing `I0001_Notes/` (8 subfolders, ~512M records).
+
+```bash
+./deploy_aws.sh i-0aaa... i-0bbb... [more instance IDs...]
+```
+
+Key config:
+```bash
+BUCKET="bdsp-site-mgb"
+INPUT_PREFIX="I0001_Notes/"
+OUTPUT_PREFIX="philter-deidentify/output"
+NUM_WORKERS=60
+NOTE_TYPE="clinicalnotes"
+```
+
+This script handles subfolder assignment (each instance processes one or more subfolders).
+
+---
+
+## Architecture: Key Design Decisions
+
+### IAM Instance Role (no credential expiry)
+
+All EC2 instances use the `AmazonSSMRoleForInstancesQuickSetup` IAM instance profile. boto3 automatically picks up credentials from the instance metadata service — no access key file needed, no expiry after 12 hours.
+
+> Previous runs wrote SSO credentials to `~/.aws/credentials` on each instance. These expired silently after 12 hours, causing ~74.6M records to go un-de-identified in the original clinical notes run.
+
+Deploy scripts always run `rm -f ~/.aws/credentials` on each instance to ensure stale credentials don't block IAM role fallback.
+
+### S3-Direct Processing (no local disk staging)
+
+All Parquet files are read directly from S3 using `pyarrow.dataset` and written back to S3 using `pyarrow.parquet.write_table`. No local disk copy is needed, so instance storage can be minimal (50 GB vs 200 GB previously).
+
+### Watchdog Auto-Restart
+
+Every instance runs a watchdog shell loop that restarts the Python process on any crash (OOM, spot interruption, network error). The Python process reads `checkpoint.json` from S3 on startup and skips already-completed files.
+
+```
+start_watchdog.sh (background, detached via nohup)
+  └── process_parquet_aws.py (restarted on crash)
+        └── checkpoint.json (S3, tracks completed files)
+```
+
+### Sequential SSH Deploy (no parallel background jobs)
+
+Deploy scripts SSH into instances one at a time (no `&` backgrounding of deploy steps). This prevents duplicate process launches that were observed when multiple SSH sessions ran in parallel against the same instance.
+
+### Nested Heredoc Variable Escaping
+
+Deploy scripts write watchdog scripts to EC2 instances using heredocs. EC2-runtime variables (e.g., `$PYTHON`, `$(date)`, `$EXIT_CODE`) must be escaped as `\$` so they are not expanded by the local shell at write time. Deploy-time variables (bucket name, partition ID, file range) should NOT be escaped — they should expand at write time on the local machine.
+
+### File-Range Splitting
+
+The `--file-start` and `--file-end` arguments allow multiple instances to process non-overlapping ranges of files from the same flat S3 prefix. The deploy script calculates each instance's range:
+
+```
+FILES_PER_INSTANCE = ceil(TOTAL_FILES / NUM_INSTANCES)
+Instance N processes files [N * FILES_PER, (N+1) * FILES_PER)
+```
+
+---
+
+## Monitoring Reference
+
+### Check all instances — watchdog running + speed
+```bash
+KEY="/Users/anjanarayapureddy/Desktop/Philter/philter.pem"
+for IP in <ip0> <ip1> <ip2> ...; do
+    ssh -o StrictHostKeyChecking=no -i $KEY ec2-user@$IP \
+        "WC=\$(ps aux | grep start_watchdog | grep -v grep | wc -l); \
+         RATE=\$(grep 'rec/sec' ~/deidentify.log | tail -1 | grep -oP '[0-9]+\.[0-9]+ rec/sec'); \
+         echo 'watchdogs='\$WC' | '\$RATE" 2>/dev/null
+done
+```
+
+### Count S3 output files by partition
+```bash
+OUTPUT="missed_notes_output"   # or imaging_output
+for i in $(seq 0 19); do
+    COUNT=$(aws s3 --profile bidmc ls \
+        s3://bdsp-site-mgb/philter-deidentify/${OUTPUT}/partition_${i}/ 2>/dev/null \
+        | grep -c parquet || echo 0)
+    echo "Partition $i: $COUNT parquet files"
+done
+```
+
+### Check completion (one log file per partition when done)
+```bash
+aws s3 --profile bidmc ls s3://bdsp-site-mgb/philter-deidentify/missed_notes_output/logs/
+```
+
+### Read live log from one instance
+```bash
+ssh -i /path/to/philter.pem ec2-user@<ip> 'tail -50 ~/deidentify.log'
+```
+
+### Check memory usage on an instance
+```bash
+ssh -i /path/to/philter.pem ec2-user@<ip> 'free -g'
+# At 60 workers: ~40 GB used out of 128 GB (stable, no growth)
+```
+
+### Kill and restart if watchdog is stuck
+```bash
+ssh -i /path/to/philter.pem ec2-user@<ip> << 'EOF'
+# Kill old processes
+pkill -f start_watchdog.sh
+pkill -f process_parquet_aws.py
+sleep 3
+# Restart
+cd ~/philter-plus-deidentification
+nohup bash start_watchdog.sh > ~/deidentify.log 2>&1 &
+disown
+echo "Restarted"
+EOF
+```
+
+---
+
+## Cost Estimates
+
+### Current Architecture (20 × c6i.16xlarge Spot)
+
+| Resource | Rate | Cost |
+|----------|------|------|
+| 20 × c6i.16xlarge Spot | ~$0.68/hr each | ~$0.68 × 20 × runtime |
+| EBS (50 GB × 20 instances) | $0.08/GB-month | ~$2/day |
+| S3 requests + transfer | — | ~$10-20 |
+
+Estimated runtimes at ~120 rec/sec per instance:
+
+| Dataset | Records | Instances | Est. Runtime | Est. Cost |
+|---------|---------|-----------|--------------|-----------|
+| Imaging Reports | 47.6M | 20 | ~1.7 hours | **~$25** |
+| Missed Clinical Notes | 108.8M | 20 | ~4 hours | **~$55** |
+
+### Previous Architecture (for reference)
+
+The original clinical notes run used SSO credentials written to instances (11 × c6i.32xlarge). Due to credential expiry and no watchdog, ~74.6M records were not processed despite running for ~$600.
+
+### Worker Count Guidelines
+
+| Instance Type | vCPUs | RAM | Safe Workers | Memory at Max Workers |
+|---------------|-------|-----|--------------|----------------------|
+| c6i.16xlarge | 64 | 128 GB | 60 | ~40 GB stable |
+| c6i.4xlarge | 16 | 32 GB | 40 | ~25 GB stable |
+
+> Never exceed 1 worker per vCPU × 1.25. OOM was observed at 120 workers on c6i.32xlarge (248 GB RAM).
+
+---
+
+## File Reference
+
+| File | Description |
+|------|-------------|
+| `deploy_missed_notes.sh` | Deploy missed clinical notes run to N instances |
+| `deploy_imaging.sh` | Deploy imaging reports run to N instances |
+| `deploy_aws.sh` | Deploy original clinical notes run to N instances |
+| `process_parquet_aws.py` | Main de-id script — reads from S3, de-identifies, writes to S3. Accepts `--note-type clinicalnotes\|imagingreport`, `--file-start`/`--file-end` for range splitting |
+| `generate_stats.py` | Post-run verification — compares input record count vs output. Accepts `--note-type` |
+| `extract_not_deidentified.py` | Extracts records not present in output (for re-run). Used after original clinical notes run |
+| `run_extract.sh` | Shell wrapper to run `extract_not_deidentified.py` |
+| `repartition_s3.py` | Stream-repartition large Parquet files in S3 to uniform ~500K-row chunks (not needed for current flat-folder runs) |
+| `check_deployment_ready.sh` | Pre-flight checks — verifies AWS credentials, S3 access, config file |
+| `cleanup_aws.sh` | Terminates instances and cleans up S3 output prefix |
+| `read_parquet.py` | Utility — read and print any Parquet file (local or S3) |
+| `philter.py` | Philter NLP de-identification engine |
+| `keyword_removal.py` | Site-specific keyword removal (hospital names, MRNs, etc.) |
+| `configs/philter_one.json` | Philter configuration (330 filter rules) |
 
 ---
 
 ## Local Setup
+
+For running stats, verification, or the extract script locally:
 
 ```bash
 # Create conda environment
@@ -127,7 +647,6 @@ conda create -n philter python=3.9 -y
 conda activate philter
 
 # Install dependencies
-pip install -r requirements.txt
 pip install pyarrow pandas boto3 s3fs nltk
 
 # Download NLTK data (required by Philter)
@@ -138,336 +657,11 @@ nltk.download('averaged_perceptron_tagger_eng')
 nltk.download('punkt')
 nltk.download('punkt_tab')
 "
-```
 
-### Read a Parquet file locally
+# Configure AWS profile
+aws configure --profile bidmc
 
-```bash
-# Local file
-python read_parquet.py /path/to/file.parquet
-
-# S3 file
-python read_parquet.py s3://bdsp-site-mgb/philter-deidentify/output/ --profile bidmc --rows 20
-```
-
----
-
-## Testing on EC2 (Completed Feb 24, 2026)
-
-Comprehensive testing was performed on a single **c6i.16xlarge** instance (64 vCPU, 128 GB RAM) in `us-east-1a` over 6+ hours. All tests passed.
-
-### Test A: Correctness (Single File)
-
-Processed 1 repartitioned file (~500K records) to validate de-identification quality.
-
-| Metric | Result |
-|--------|--------|
-| Input records | 500,000 |
-| Output records | 498,925 (99.8% retention) |
-| Output columns | `BDSPPatientID`, `bdsp_encounter_id`, `ShiftedContactDate`, `NoteTXT`, `de_id_filename` |
-| Star replacement ratio | 6.3% of characters replaced with `*` |
-| Speed | 86.7 rec/sec (first file, includes warmup) |
-| Memory | 19-20 GB (stable) |
-
-### Test B: Crash Recovery
-
-Started processing 2 files, killed the process after file 1 completed, restarted.
-
-| Metric | Result |
-|--------|--------|
-| Checkpoint detection | "Checkpoint found: 1 files already done" |
-| File 1 reprocessed? | No (correctly skipped) |
-| File 1 output intact? | Yes |
-| File 2 reprocessed? | Yes (re-started from beginning, as expected) |
-
-### Test C: Memory Stability & Sustained Speed (6+ hours)
-
-Ran the full `Notes_parquet_18_19` subfolder (191 repartitioned files, ~93M records) for 6+ hours continuously.
-
-| Metric | Result |
-|--------|--------|
-| Duration | 6+ hours (still running at test end) |
-| Files completed | 5 of 191 (~2.5M records) |
-| Speed (file 1, warmup) | 86.7 rec/sec |
-| Speed (files 2-5, sustained) | **130-145 rec/sec** |
-| Memory at start | 15 GB |
-| Memory at 6 hours | 32-34 GB (stable, no growth) |
-| OOM crashes | **None** |
-| Worker processes alive | 31 (1 main + 30 workers) throughout |
-
-### Key Optimizations Applied During Testing
-
-| Problem | Root Cause | Fix | Impact |
-|---------|-----------|-----|--------|
-| OOM crashes (120 workers) | Too many workers + deep copy memory growth | Reduced to 30 workers + reference assignment | Memory: 200+ GB → 32 GB stable |
-| Slow speed (12.5 rec/sec) | `pool.map()` straggler blocking | `pool.imap_unordered()` with 200-record sub-batches | Speed: 12.5 → 130+ rec/sec |
-| Memory growth over time | `copy.deepcopy(data)` per batch | Reference assignment (safe: map_coordinates only reads then deletes key) | Memory stable over 6+ hours |
-| Workers running out of work | Batch loop with only 50 sub-batches | Process entire file at once (2500 sub-batches for 500K records) | All 30 workers stay busy |
-| Slow data extraction | `df.iterrows()` | Vectorized `list(zip(df[col].values, ...))` | 100x faster extraction |
-
-### Running a Test
-
-```bash
-# SSH into a c6i.16xlarge instance
-ssh -i /path/to/key.pem ec2-user@<ip>
-
-# Run on a single file
-python3.9 process_parquet_aws.py \
-    --input-path /home/ec2-user/test_input/ \
-    --output-path /home/ec2-user/test_output/ \
-    --workers 30 \
-    --philter-config configs/philter_one.json
-```
-
----
-
-## Production Deployment (11 × c6i.16xlarge Spot)
-
-### Important: AWS Session Token Expires in 12 Hours
-
-The `bidmc` AWS credentials use a session token that expires after 12 hours. Since processing takes ~5.5 days, data must be copied to EC2 local disk **before** credentials expire. The pipeline:
-
-```
-Phase 1 (within 12hrs):  S3 → EC2 local disk (download + repartition)
-Phase 2 (~5.5 days):     De-identify on local disk (no AWS access needed)
-Phase 3 (after done):    Refresh credentials → upload EC2 local disk → S3
-```
-
-### Instance Configuration
-
-| Setting | Value |
-|---------|-------|
-| Instance type | **c6i.16xlarge** (64 vCPU, 128 GB RAM) |
-| Pricing | **Spot** (~$1.10/hr, 60% cheaper than on-demand) |
-| EBS | **200 GB gp3** per instance |
-| Workers | 30 |
-| Sub-batch size | 200 records |
-| maxtasksperchild | 3 (periodic worker restart to control memory) |
-| Availability Zone | `us-east-1a` |
-| Subnet | `subnet-032f4ed8e15acf550` (CIDR: 10.224.10.0/28, 11 usable IPs) |
-
-### Repartitioning
-
-Original S3 parquet files can be very large (up to 7.5M records per file). These must be split into ~500K record chunks to prevent OOM during processing. Each instance runs a repartition step after downloading from S3:
-
-```bash
-# Repartitions large parquet files into ~500K record chunks
-python3.9 repartition.py /home/ec2-user/input/<subfolder>/ --max-rows 500000
-```
-
-### Partition Assignments (11 instances)
-
-The 3 largest subfolders are split across 2 instances each using `--file-start`/`--file-end`. Smaller subfolders get 1 instance each.
-
-| # | Subfolder | File Range | ~Records | ~Days |
-|---|-----------|------------|----------|-------|
-| 1 | `Notes_parquet_18_19` | first half | ~47M | ~4 |
-| 2 | `Notes_parquet_18_19` | second half | ~46M | ~4 |
-| 3 | `Notes_parquet_24` | first half | ~46M | ~4 |
-| 4 | `Notes_parquet_24` | second half | ~45M | ~4 |
-| 5 | `Notes_parquet_23` first half + `Notes_parquet_15_and_before` | all | ~52M | ~4.5 |
-| 6 | `Notes_parquet_23` | second half | ~35M | ~3 |
-| 7 | `Notes_parquet_16_17` | first half | ~32M | ~3 |
-| 8 | `Notes_parquet_16_17` | second half | ~32M | ~3 |
-| 9 | `Notes_parquet_22` | all | ~62M | ~5.5 |
-| 10 | `Notes_parquet_21` | all | ~60M | ~5 |
-| 11 | `Notes_parquet_20` | all | ~55M | ~5 |
-
-### Running with File Range Splitting
-
-For instances that process only part of a subfolder:
-
-```bash
-# Instance 1: first half of 18_19 (files 0-95)
-python3.9 process_parquet_aws.py \
-    --input-path /home/ec2-user/input/Notes_parquet_18_19/ \
-    --output-path /home/ec2-user/output/Notes_parquet_18_19_a/ \
-    --workers 30 --philter-config configs/philter_one.json \
-    --file-start 0 --file-end 96
-
-# Instance 2: second half of 18_19 (files 96+)
-python3.9 process_parquet_aws.py \
-    --input-path /home/ec2-user/input/Notes_parquet_18_19/ \
-    --output-path /home/ec2-user/output/Notes_parquet_18_19_b/ \
-    --workers 30 --philter-config configs/philter_one.json \
-    --file-start 96
-```
-
-For instances that process a full subfolder (no splitting needed):
-
-```bash
-python3.9 process_parquet_aws.py \
-    --input-path /home/ec2-user/input/Notes_parquet_22/ \
-    --output-path /home/ec2-user/output/Notes_parquet_22/ \
-    --workers 30 --philter-config configs/philter_one.json
-```
-
-### Checkpoint & Crash Recovery
-
-- Checkpoint saved after **each file** (not every N records)
-- On restart, completed files are **skipped automatically**
-- Only the current in-progress file is re-processed (~500K records, ~60 min)
-- Spot interruptions are handled gracefully — relaunch and resume
-- Output parquet files survive instance stop/restart (stored on EBS)
-
-### Data on EC2 Instance
-
-```
-/home/ec2-user/
-├── input/                                   ← Copied from S3, repartitioned
-│   └── Notes_parquet_18_19/
-│       ├── chunk_000000.parquet             (~500K records each)
-│       ├── chunk_000001.parquet
-│       └── ... (191 files for 18_19)
-├── output/                                  ← De-identified results
-│   └── Notes_parquet_18_19/
-│       ├── batch_000001.parquet
-│       ├── batch_000002.parquet
-│       └── checkpoint.json                  ← Tracks completed files
-└── philter-plus-deidentification/           ← Project code
-```
-
-### After Processing Completes (~5.5 days)
-
-1. **Refresh AWS credentials** in `~/.aws/credentials` on your local machine
-2. **Update credentials on each EC2 instance:**
-
-```bash
-scp -i /path/to/key.pem ~/.aws/credentials ec2-user@<worker-ip>:~/.aws/credentials
-```
-
-3. **Upload results from each instance to S3:**
-
-```bash
-ssh -i /path/to/key.pem ec2-user@<worker-ip> \
-    'aws s3 sync /home/ec2-user/output/ s3://bdsp-site-mgb/philter-deidentify/output/'
-```
-
-4. **Download all results locally:**
-
-```bash
-aws s3 --profile bidmc sync s3://bdsp-site-mgb/philter-deidentify/output/ ./deidentified_output/
-```
-
----
-
-## Monitoring
-
-### SSH into a worker for live progress
-
-```bash
-ssh -i /path/to/key.pem ec2-user@<worker-ip>
-
-# Watch the log in real time
-tail -f /home/ec2-user/processing.log
-```
-
-You'll see output like:
-```
---- File 12/191: chunk_000011.parquet ---
-  Loaded 500,000 records (2.1 GB)
-  Split into 2500 sub-batches of 200 records
-  Progress: 1250/2500 sub-batches (50%), 249,531 output, 143.6 rec/sec
-  Progress: 2500/2500 sub-batches (100%), 498,945 output, 138.7 rec/sec
-  Wrote batch 12: 498945 records to /home/ec2-user/output/.../batch_000012.parquet
-  File done in 60.2 min
-  Progress: 12/191 files, 6,000,000 records, 135.2 rec/sec
-```
-
-### Quick status check (one-liner)
-
-```bash
-ssh -i /path/to/key.pem ec2-user@<worker-ip> \
-    'ps aux | grep process_parquet | grep -v grep | wc -l && echo "procs" && \
-     cat /home/ec2-user/output/*/checkpoint.json 2>/dev/null | python3.9 -c "import sys,json; d=json.load(sys.stdin); print(f\"Files: {len(d[\"completed_files\"])}, Records: {d[\"processed_count\"]:,}\")" && \
-     free -g | grep Mem'
-```
-
-### Check memory and worker health
-
-```bash
-ssh -i /path/to/key.pem ec2-user@<worker-ip> \
-    'free -g | grep Mem && ps aux | grep process_parquet | grep -v grep | wc -l && echo "processes"'
-```
-
-### Check local output files on instance
-
-```bash
-ssh -i /path/to/key.pem ec2-user@<worker-ip> 'du -sh /home/ec2-user/output/* && ls /home/ec2-user/output/*/*.parquet | wc -l && echo "output files"'
-```
-
-### Check disk space
-
-```bash
-ssh -i /path/to/key.pem ec2-user@<worker-ip> 'df -h /home/ec2-user'
-```
-
----
-
-## Cost Estimate
-
-### Production (11 × c6i.16xlarge Spot)
-
-| Resource | Cost |
-|----------|------|
-| 11 spot instances × ~45 instance-days total | ~$1,200 |
-| EBS storage (200 GB × 11 × 5.5 days) | ~$32 |
-| S3 data transfer | ~$20-30 |
-| **Total** | **~$1,250** |
-
-Estimated runtime: **~5.5 days** (bottleneck: largest unsplit subfolder at 62M records)
-
-Most instances finish in 3-4 days. Only instances 9-11 (full medium subfolders) run the full 5-5.5 days.
-
-### Spot vs On-Demand
-
-| | Spot | On-Demand |
-|---|------|-----------|
-| c6i.16xlarge hourly rate | ~$1.10/hr | $2.72/hr |
-| 11 instances × 5.5 days | **~$1,200** | **~$3,200** |
-| Interruption risk | ~5% (recovered via checkpoint) | None |
-
-### Testing Cost
-
-Single c6i.16xlarge on-demand for 24 hours: ~$65-70 (compute) + EBS
-
----
-
-## File Reference
-
-| File | Description |
-|------|-------------|
-| `deploy_production.sh` | **Production deployment** — SCPs project to 4 EC2 instances, starts processing |
-| `test_ec2_schema.sh` | **Test script** — runs 500-row end-to-end test on 1 EC2 instance |
-| `check_status.sh` | **Monitoring** — checks completion logs, checkpoints, output files |
-| `check_deployment_ready.sh` | **Pre-flight checks** — verifies credentials, S3 access, config file |
-| `process_parquet_aws.py` | Runs on EC2 — reads local Parquet, de-identifies with 30 workers, writes output. Supports `--file-start`/`--file-end` for splitting subfolders across instances |
-| `read_parquet.py` | Utility — read and print any Parquet file (local or S3) |
-| `philter.py` | Philter NLP de-identification engine |
-| `keyword_removal.py` | Site-specific keyword removal (hospital names, MRNs, etc.) |
-| `configs/philter_one.json` | Philter configuration (330 filter rules) |
-| `deploy_aws.sh` | Automated deployment (creates instances via AWS CLI) |
-| `cleanup_aws.sh` | Terminates instances and cleans up S3 |
-| `requirements.txt` | Python package dependencies |
-
----
-
-## S3 Layout
-
-```
-s3://bdsp-site-mgb/
-├── I0001_Notes/                              ← INPUT (do not modify)
-│   ├── Notes_parquet_15_and_before/
-│   ├── Notes_parquet_16_17/
-│   ├── Notes_parquet_18_19/
-│   ├── Notes_parquet_20/
-│   ├── Notes_parquet_21/
-│   ├── Notes_parquet_22/
-│   ├── Notes_parquet_23/
-│   └── Notes_parquet_24/
-└── philter-deidentify/                       ← OUTPUT
-    ├── assignments/partition_0..10.txt
-    ├── config/philter_one.json
-    ├── output/                               ← De-identified Parquet files
-    └── logs/partition_X_complete.log          ← Completion markers
+# Read a Parquet file from S3
+python read_parquet.py s3://bdsp-site-mgb/philter-deidentify/imaging_output/partition_0/ \
+    --profile bidmc --rows 20
 ```

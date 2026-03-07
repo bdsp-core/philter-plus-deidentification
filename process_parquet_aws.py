@@ -254,6 +254,7 @@ def save_checkpoint(checkpoint_path, processed_count, batch_num, completed_files
     if checkpoint_path.startswith('s3://'):
         s3 = boto3.client('s3')
         bucket, key = checkpoint_path.replace('s3://', '').split('/', 1)
+        key = key.rstrip('/')
         s3.put_object(
             Bucket=bucket,
             Key=f"{key}/checkpoint.json",
@@ -272,6 +273,7 @@ def load_checkpoint(checkpoint_path):
         if checkpoint_path.startswith('s3://'):
             s3 = boto3.client('s3')
             bucket, key = checkpoint_path.replace('s3://', '').split('/', 1)
+            key = key.rstrip('/')
             obj = s3.get_object(Bucket=bucket, Key=f"{key}/checkpoint.json")
             return json.loads(obj['Body'].read())
         else:
@@ -284,12 +286,12 @@ def load_checkpoint(checkpoint_path):
     return None
 
 
-def write_parquet_batch(results, output_path, batch_num):
+def write_parquet_batch(results, output_path, batch_num, text_col='NoteTXT'):
     """Write results to Parquet file."""
-    df = pd.DataFrame(results, columns=['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'NoteTXT', 'de_id_filename'])
+    df = pd.DataFrame(results, columns=['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', text_col, 'de_id_filename'])
     table = pa.Table.from_pandas(df)
 
-    output_file = f"{output_path}/batch_{batch_num:06d}.parquet"
+    output_file = f"{output_path.rstrip('/')}/batch_{batch_num:06d}.parquet"
 
     if output_path.startswith('s3://'):
         # Write to S3
@@ -305,19 +307,23 @@ def write_parquet_batch(results, output_path, batch_num):
     logger.warning(f"  Wrote batch {batch_num}: {len(results)} records to {output_file}")
 
 
-def write_status_csv(status_records, output_path, partition_id):
+def write_status_csv(status_records, output_path, partition_id, id_col='NoteCSNID'):
     """Append status records to the partition-level status CSV."""
-    csv_file = os.path.join(output_path, f"status_partition_{partition_id}.csv")
+    if output_path.startswith('s3://'):
+        # S3 doesn't support append — write locally on the instance
+        csv_file = os.path.expanduser(f"~/status_partition_{partition_id}.csv")
+    else:
+        csv_file = os.path.join(output_path, f"status_partition_{partition_id}.csv")
     write_header = not os.path.exists(csv_file)
 
     with open(csv_file, 'a', newline='') as f:
         writer = csv.writer(f)
         if write_header:
-            writer.writerow(["NoteCSNID", "de_id_filename", "status"])
+            writer.writerow([id_col, "de_id_filename", "status"])
         writer.writerows(status_records)
 
 
-def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None):
+def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None, id_col='NoteCSNID', text_col='NoteTXT'):
     """
     Process a partition of Parquet files.
 
@@ -386,7 +392,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     # Verify schema from first remaining file
     first_table = pq.read_table(remaining_files[0])
     cols = first_table.column_names
-    required_cols = ['NoteCSNID', 'BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'NoteTXT', 'de_id_filename']
+    required_cols = ['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'de_id_filename', id_col, text_col]
     missing = [c for c in required_cols if c not in cols]
     if missing:
         logger.error(f"Missing columns: {missing}")
@@ -414,7 +420,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
 
     # Chunked reading: read large files in 500K-row chunks to avoid 32GB+ memory spikes
     CHUNK_ROWS = 500000
-    NEED_COLS = ['NoteCSNID', 'BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'NoteTXT', 'de_id_filename']
+    NEED_COLS = ['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'de_id_filename', id_col, text_col]
     SUB_BATCH_SIZE = 20
     WRITE_THRESHOLD = 100000  # Write every 100K results to cap memory
     all_status_records = []
@@ -452,11 +458,11 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
             logger.warning(f"  Chunk {chunk_num}/{num_chunks}: {chunk_records:,} records ({chunk_gb:.1f} GB)")
 
             file_data = list(zip(
-                df_chunk['NoteCSNID'].values,
+                df_chunk[id_col].values,
                 df_chunk['BDSPPatientID'].values,
                 df_chunk['bdsp_encounter_id'].values,
                 df_chunk['ShiftedContactDate'].values,
-                df_chunk['NoteTXT'].values,
+                df_chunk[text_col].values,
                 df_chunk['de_id_filename'].values
             ))
             del df_chunk
@@ -484,13 +490,13 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
                 # Intermediate write to cap memory
                 if len(all_results) >= WRITE_THRESHOLD:
                     batch_num += 1
-                    write_parquet_batch(all_results, output_path, batch_num)
+                    write_parquet_batch(all_results, output_path, batch_num, text_col=text_col)
                     all_results = []
                     gc.collect()
 
                 # Flush status CSV periodically to avoid large in-memory accumulation
                 if len(all_status_records) >= WRITE_THRESHOLD:
-                    write_status_csv(all_status_records, output_path, partition_id)
+                    write_status_csv(all_status_records, output_path, partition_id, id_col=id_col)
                     all_status_records = []
 
             del file_data
@@ -506,12 +512,12 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         # Write remaining results for this file
         if all_results:
             batch_num += 1
-            write_parquet_batch(all_results, output_path, batch_num)
+            write_parquet_batch(all_results, output_path, batch_num, text_col=text_col)
             all_results = []
 
         # Flush remaining status records for this file
         if all_status_records:
-            write_status_csv(all_status_records, output_path, partition_id)
+            write_status_csv(all_status_records, output_path, partition_id, id_col=id_col)
             all_status_records = []
 
         # Mark this file as completed in checkpoint
@@ -531,7 +537,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
 
     # Write any remaining results
     if all_results:
-        write_parquet_batch(all_results, output_path, batch_num)
+        write_parquet_batch(all_results, output_path, batch_num, text_col=text_col)
 
     # Cleanup
     pool.close()
@@ -559,8 +565,17 @@ def main():
     parser.add_argument('--philter-config', default='configs/philter_one.json', help='Path to Philter config')
     parser.add_argument('--file-start', type=int, default=0, help='Index of first file to process (0-based, for splitting subfolders)')
     parser.add_argument('--file-end', type=int, default=None, help='Index of last file (exclusive, for splitting subfolders)')
+    parser.add_argument('--note-type', choices=['clinicalnotes', 'imagingreport'], default='clinicalnotes',
+                        help='Type of notes: clinicalnotes (NoteTXT/NoteCSNID) or imagingreport (ReportTXT/OrderProcedureID)')
 
     args = parser.parse_args()
+
+    if args.note_type == 'imagingreport':
+        id_col = 'OrderProcedureID'
+        text_col = 'ReportTXT'
+    else:
+        id_col = 'NoteCSNID'
+        text_col = 'NoteTXT'
 
     # Validate paths
     if args.input_path.startswith('s3://'):
@@ -576,7 +591,9 @@ def main():
         batch_size=args.batch_size,
         philter_config=args.philter_config,
         file_start=args.file_start,
-        file_end=args.file_end
+        file_end=args.file_end,
+        id_col=id_col,
+        text_col=text_col,
     )
 
 

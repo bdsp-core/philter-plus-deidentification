@@ -90,7 +90,7 @@ def build_output_set(output_paths):
     return deid_keys
 
 
-def generate_stats(input_path, output_paths, stats_file, append=False):
+def generate_stats(input_path, output_paths, stats_file, append=False, id_col='NoteCSNID'):
     """
     Compare input vs output and write stats CSV.
     Streams input files one at a time — memory-safe.
@@ -123,11 +123,11 @@ def generate_stats(input_path, output_paths, stats_file, append=False):
     with open(stats_file, write_mode, newline="") as csvf:
         writer = csv.writer(csvf)
         if write_header:
-            writer.writerow(["NoteCSNID", "de_id_filename", "status"])
+            writer.writerow([id_col, "de_id_filename", "status"])
 
         for i, f in enumerate(input_files):
             logger.info(f"  [{i+1}/{len(input_files)}] {os.path.basename(f)}")
-            df = read_parquet_columns(f, ["NoteCSNID", "de_id_filename"])
+            df = read_parquet_columns(f, [id_col, "de_id_filename"])
 
             # Vectorized comparison — much faster than iterrows
             df["de_id_filename"] = df["de_id_filename"].fillna("").astype(str)
@@ -135,7 +135,7 @@ def generate_stats(input_path, output_paths, stats_file, append=False):
                 lambda x: "deidentified" if x in deid_keys else "not_deidentified"
             )
 
-            writer.writerows(df[["NoteCSNID", "de_id_filename", "status"]].values.tolist())
+            writer.writerows(df[[id_col, "de_id_filename", "status"]].values.tolist())
 
             file_deid = (df["status"] == "deidentified").sum()
             file_not  = (df["status"] == "not_deidentified").sum()
@@ -164,12 +164,15 @@ def main():
                         help="Local path for the output stats CSV")
     parser.add_argument("--append",       action="store_true",
                         help="Append to stats-file instead of overwriting")
+    parser.add_argument("--note-type", choices=['clinicalnotes', 'imagingreport'], default='clinicalnotes',
+                        help="Type of notes: clinicalnotes (NoteCSNID) or imagingreport (OrderProcedureID)")
     args = parser.parse_args()
 
+    id_col = 'OrderProcedureID' if args.note_type == 'imagingreport' else 'NoteCSNID'
     output_paths = [p.strip() for p in args.output_paths.split(",")]
 
     start = datetime.now()
-    generate_stats(args.input_path, output_paths, args.stats_file, append=args.append)
+    generate_stats(args.input_path, output_paths, args.stats_file, append=args.append, id_col=id_col)
     elapsed = (datetime.now() - start).total_seconds()
     logger.info(f"Done in {elapsed:.1f}s")
 
