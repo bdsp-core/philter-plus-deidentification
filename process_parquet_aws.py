@@ -242,6 +242,122 @@ def _process_batch(batch_data):
     return results, status_records
 
 
+def _process_batch_bi(batch_data):
+    """
+    Process a batch of BI_Clinical_Notes records.
+
+    Args:
+        batch_data: List of (clinicalnotetextkey, type_val, shifted_creation, count_val,
+                    text, deidentified_name) tuples
+
+    Returns:
+        Tuple of:
+          - List of (deidentified_name, deid_text, type_val, shifted_creation, count_val) tuples
+          - List of (CLINICALNOTETEXTKEY, DeidentifiedName, status) tuples
+    """
+    global _philter_instance
+
+    if _philter_instance is None:
+        return [], []
+
+    texts_dict = {}
+    record_map = {}
+    status_records = []
+
+    for clinicalnotetextkey, type_val, shifted_creation, count_val, text, deidentified_name in batch_data:
+        if not text or len(str(text).strip()) == 0:
+            status_records.append((clinicalnotetextkey, str(deidentified_name), "skipped"))
+            continue
+
+        deid_key = str(deidentified_name)
+        cleaned_text = keyword_removal.remove_keywords(str(text))
+        texts_dict[deid_key] = cleaned_text
+        record_map[deid_key] = (clinicalnotetextkey, type_val, shifted_creation, count_val)
+
+    if not texts_dict:
+        return [], status_records
+
+    _philter_instance.include_map.map.clear()
+    _philter_instance.include_map.all_coords.clear()
+    _philter_instance.include_map.coord2pattern.clear()
+    _philter_instance.exclude_map.map.clear()
+    _philter_instance.exclude_map.all_coords.clear()
+    _philter_instance.exclude_map.coord2pattern.clear()
+    _philter_instance.data_all_files.clear()
+    for phi_type in _philter_instance.phi_type_list:
+        _philter_instance.phi_type_dict[phi_type][0].map.clear()
+        _philter_instance.phi_type_dict[phi_type][0].all_coords.clear()
+        _philter_instance.phi_type_dict[phi_type][0].coord2pattern.clear()
+
+    for i, data in _pattern_data_cache.items():
+        _philter_instance.patterns[i]["data"] = data
+
+    results = []
+
+    def _alarm_handler(signum, frame):
+        raise TimeoutError("Batch timed out")
+
+    try:
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(60)
+
+        _philter_instance.texts = texts_dict
+        _philter_instance.filenames = list(texts_dict.keys())
+        _philter_instance.map_coordinates()
+
+        signal.alarm(0)
+
+        for deid_key in texts_dict.keys():
+            try:
+                deid_text = _fast_transform(texts_dict[deid_key], deid_key, _philter_instance)
+                clinicalnotetextkey, type_val, shifted_creation, count_val = record_map[deid_key]
+                results.append((deid_key, deid_text, type_val, shifted_creation, count_val))
+                status_records.append((clinicalnotetextkey, deid_key, "deidentified"))
+            except Exception as e1:
+                try:
+                    deid_text = _philter_instance.transform_text_asterisk(texts_dict[deid_key], deid_key)
+                    clinicalnotetextkey, type_val, shifted_creation, count_val = record_map[deid_key]
+                    results.append((deid_key, deid_text, type_val, shifted_creation, count_val))
+                    status_records.append((clinicalnotetextkey, deid_key, "deidentified"))
+                except Exception as e2:
+                    logger.warning(f"Worker {os.getpid()}: Failed record {deid_key}: fast={e1}, fallback={e2}")
+    except TimeoutError:
+        signal.alarm(0)
+        logger.warning(f"Worker {os.getpid()}: TIMEOUT — batch of {len(texts_dict)} records falling back to full redaction")
+        for deid_key in texts_dict.keys():
+            try:
+                deid_text = re.sub(r'[a-zA-Z0-9]', '*', texts_dict[deid_key])
+                clinicalnotetextkey, type_val, shifted_creation, count_val = record_map[deid_key]
+                results.append((deid_key, deid_text, type_val, shifted_creation, count_val))
+                status_records.append((clinicalnotetextkey, deid_key, "full_redaction"))
+            except Exception:
+                pass
+    except Exception as e:
+        signal.alarm(0)
+        logger.error(f"Worker {os.getpid()}: map_coordinates failed for {len(texts_dict)} texts: {e}")
+        import traceback
+        traceback.print_exc()
+
+    texts_dict.clear()
+    record_map.clear()
+    _philter_instance.include_map.map.clear()
+    _philter_instance.include_map.all_coords.clear()
+    _philter_instance.include_map.coord2pattern.clear()
+    _philter_instance.exclude_map.map.clear()
+    _philter_instance.exclude_map.all_coords.clear()
+    _philter_instance.exclude_map.coord2pattern.clear()
+    _philter_instance.data_all_files.clear()
+    _philter_instance.texts.clear()
+    _philter_instance.filenames.clear()
+    for phi_type in _philter_instance.phi_type_list:
+        _philter_instance.phi_type_dict[phi_type][0].map.clear()
+        _philter_instance.phi_type_dict[phi_type][0].all_coords.clear()
+        _philter_instance.phi_type_dict[phi_type][0].coord2pattern.clear()
+    gc.collect()
+
+    return results, status_records
+
+
 def save_checkpoint(checkpoint_path, processed_count, batch_num, completed_files=None):
     """Save progress checkpoint."""
     checkpoint = {
@@ -286,9 +402,12 @@ def load_checkpoint(checkpoint_path):
     return None
 
 
-def write_parquet_batch(results, output_path, batch_num, text_col='NoteTXT'):
+def write_parquet_batch(results, output_path, batch_num, text_col='NoteTXT', note_type='clinicalnotes'):
     """Write results to Parquet file."""
-    df = pd.DataFrame(results, columns=['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', text_col, 'de_id_filename'])
+    if note_type == 'bi_clinicalnotes':
+        df = pd.DataFrame(results, columns=['DeidentifiedName', 'TEXT', 'TYPE', 'CREATIONINSTANT', 'COUNT'])
+    else:
+        df = pd.DataFrame(results, columns=['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', text_col, 'de_id_filename'])
     table = pa.Table.from_pandas(df)
 
     output_file = f"{output_path.rstrip('/')}/batch_{batch_num:06d}.parquet"
@@ -307,7 +426,7 @@ def write_parquet_batch(results, output_path, batch_num, text_col='NoteTXT'):
     logger.warning(f"  Wrote batch {batch_num}: {len(results)} records to {output_file}")
 
 
-def write_status_csv(status_records, output_path, partition_id, id_col='NoteCSNID'):
+def write_status_csv(status_records, output_path, partition_id, id_col='NoteCSNID', filename_col='de_id_filename'):
     """Append status records to the partition-level status CSV."""
     if output_path.startswith('s3://'):
         # S3 doesn't support append — write locally on the instance
@@ -319,11 +438,11 @@ def write_status_csv(status_records, output_path, partition_id, id_col='NoteCSNI
     with open(csv_file, 'a', newline='') as f:
         writer = csv.writer(f)
         if write_header:
-            writer.writerow([id_col, "de_id_filename", "status"])
+            writer.writerow([id_col, filename_col, "status"])
         writer.writerows(status_records)
 
 
-def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None, id_col='NoteCSNID', text_col='NoteTXT'):
+def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None, id_col='NoteCSNID', text_col='NoteTXT', note_type='clinicalnotes', filename_col='de_id_filename'):
     """
     Process a partition of Parquet files.
 
@@ -389,11 +508,18 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         logger.warning("All files already processed! Nothing to do.")
         return
 
+    # Define columns needed based on note type (must be before schema check)
+    if note_type == 'bi_clinicalnotes':
+        NEED_COLS = [id_col, 'TYPE', 'SHIFTED_CREATIONINSTANT', 'COUNT', text_col, filename_col]
+        batch_fn = _process_batch_bi
+    else:
+        NEED_COLS = ['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', filename_col, id_col, text_col]
+        batch_fn = _process_batch
+
     # Verify schema from first remaining file
     first_table = pq.read_table(remaining_files[0])
     cols = first_table.column_names
-    required_cols = ['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'de_id_filename', id_col, text_col]
-    missing = [c for c in required_cols if c not in cols]
+    missing = [c for c in NEED_COLS if c not in cols]
     if missing:
         logger.error(f"Missing columns: {missing}")
         logger.error(f"Available columns: {cols}")
@@ -420,7 +546,6 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
 
     # Chunked reading: read large files in 500K-row chunks to avoid 32GB+ memory spikes
     CHUNK_ROWS = 500000
-    NEED_COLS = ['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', 'de_id_filename', id_col, text_col]
     SUB_BATCH_SIZE = 20
     WRITE_THRESHOLD = 100000  # Write every 100K results to cap memory
     all_status_records = []
@@ -457,14 +582,24 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
             chunk_gb = df_chunk.memory_usage(deep=True).sum() / 1024**3
             logger.warning(f"  Chunk {chunk_num}/{num_chunks}: {chunk_records:,} records ({chunk_gb:.1f} GB)")
 
-            file_data = list(zip(
-                df_chunk[id_col].values,
-                df_chunk['BDSPPatientID'].values,
-                df_chunk['bdsp_encounter_id'].values,
-                df_chunk['ShiftedContactDate'].values,
-                df_chunk[text_col].values,
-                df_chunk['de_id_filename'].values
-            ))
+            if note_type == 'bi_clinicalnotes':
+                file_data = list(zip(
+                    df_chunk[id_col].values,
+                    df_chunk['TYPE'].values,
+                    df_chunk['SHIFTED_CREATIONINSTANT'].values,
+                    df_chunk['COUNT'].values,
+                    df_chunk[text_col].values,
+                    df_chunk[filename_col].values
+                ))
+            else:
+                file_data = list(zip(
+                    df_chunk[id_col].values,
+                    df_chunk['BDSPPatientID'].values,
+                    df_chunk['bdsp_encounter_id'].values,
+                    df_chunk['ShiftedContactDate'].values,
+                    df_chunk[text_col].values,
+                    df_chunk[filename_col].values
+                ))
             del df_chunk
 
             worker_batches = [file_data[j:j+SUB_BATCH_SIZE]
@@ -473,7 +608,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
             sub_batches_done = 0
             progress_interval = max(1, min(100, len(worker_batches) // 10))
 
-            for result_list, status_list in pool.imap_unordered(_process_batch, worker_batches):
+            for result_list, status_list in pool.imap_unordered(batch_fn, worker_batches):
                 all_results.extend(result_list)
                 all_status_records.extend(status_list)
                 file_result_count += len(result_list)
@@ -490,13 +625,13 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
                 # Intermediate write to cap memory
                 if len(all_results) >= WRITE_THRESHOLD:
                     batch_num += 1
-                    write_parquet_batch(all_results, output_path, batch_num, text_col=text_col)
+                    write_parquet_batch(all_results, output_path, batch_num, text_col=text_col, note_type=note_type)
                     all_results = []
                     gc.collect()
 
                 # Flush status CSV periodically to avoid large in-memory accumulation
                 if len(all_status_records) >= WRITE_THRESHOLD:
-                    write_status_csv(all_status_records, output_path, partition_id, id_col=id_col)
+                    write_status_csv(all_status_records, output_path, partition_id, id_col=id_col, filename_col=filename_col)
                     all_status_records = []
 
             del file_data
@@ -512,12 +647,12 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         # Write remaining results for this file
         if all_results:
             batch_num += 1
-            write_parquet_batch(all_results, output_path, batch_num, text_col=text_col)
+            write_parquet_batch(all_results, output_path, batch_num, text_col=text_col, note_type=note_type)
             all_results = []
 
         # Flush remaining status records for this file
         if all_status_records:
-            write_status_csv(all_status_records, output_path, partition_id, id_col=id_col)
+            write_status_csv(all_status_records, output_path, partition_id, id_col=id_col, filename_col=filename_col)
             all_status_records = []
 
         # Mark this file as completed in checkpoint
@@ -537,7 +672,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
 
     # Write any remaining results
     if all_results:
-        write_parquet_batch(all_results, output_path, batch_num, text_col=text_col)
+        write_parquet_batch(all_results, output_path, batch_num, text_col=text_col, note_type=note_type)
 
     # Cleanup
     pool.close()
@@ -565,17 +700,23 @@ def main():
     parser.add_argument('--philter-config', default='configs/philter_one.json', help='Path to Philter config')
     parser.add_argument('--file-start', type=int, default=0, help='Index of first file to process (0-based, for splitting subfolders)')
     parser.add_argument('--file-end', type=int, default=None, help='Index of last file (exclusive, for splitting subfolders)')
-    parser.add_argument('--note-type', choices=['clinicalnotes', 'imagingreport'], default='clinicalnotes',
-                        help='Type of notes: clinicalnotes (NoteTXT/NoteCSNID) or imagingreport (ReportTXT/OrderProcedureID)')
+    parser.add_argument('--note-type', choices=['clinicalnotes', 'imagingreport', 'bi_clinicalnotes'], default='clinicalnotes',
+                        help='Type of notes: clinicalnotes (NoteTXT/NoteCSNID), imagingreport (ReportTXT/OrderProcedureID), or bi_clinicalnotes (TEXT/CLINICALNOTETEXTKEY)')
 
     args = parser.parse_args()
 
     if args.note_type == 'imagingreport':
         id_col = 'OrderProcedureID'
         text_col = 'ReportTXT'
+        filename_col = 'de_id_filename'
+    elif args.note_type == 'bi_clinicalnotes':
+        id_col = 'CLINICALNOTETEXTKEY'
+        text_col = 'TEXT'
+        filename_col = 'DeidentifiedName'
     else:
         id_col = 'NoteCSNID'
         text_col = 'NoteTXT'
+        filename_col = 'de_id_filename'
 
     # Validate paths
     if args.input_path.startswith('s3://'):
@@ -594,6 +735,8 @@ def main():
         file_end=args.file_end,
         id_col=id_col,
         text_col=text_col,
+        note_type=args.note_type,
+        filename_col=filename_col,
     )
 
 

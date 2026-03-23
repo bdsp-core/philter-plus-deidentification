@@ -1,6 +1,6 @@
 # Philter De-identification Pipeline
 
-De-identifies clinical notes and imaging reports stored as Parquet files in AWS S3, using the **Philter** NLP engine. Built to process **600+ million medical records** across multiple EC2 instances in parallel — reading directly from S3 and writing back to S3 with no local disk staging.
+De-identifies clinical notes and imaging reports stored as Parquet files in AWS S3, using the **Philter** NLP engine. Built to process **800+ million medical records** across multiple EC2 instances in parallel — reading directly from S3 and writing back to S3 with no local disk staging.
 
 ---
 
@@ -32,7 +32,8 @@ De-identifies clinical notes and imaging reports stored as Parquet files in AWS 
 |---------|---------|--------|-------------|
 | Clinical Notes (original) | ~512M | **Done** (~74.6M missed due to SSO expiry) | `philter-deidentify/output/` |
 | Imaging Reports | ~47.6M | **Complete** | `philter-deidentify/imaging_output/partition_{0-19}/` |
-| Missed Clinical Notes | ~108.8M | **In progress** | `philter-deidentify/missed_notes_output/partition_{0-19}/` |
+| Missed Clinical Notes | ~108.8M | **Complete** | `philter-deidentify/missed_notes_output/partition_{0-19}/` |
+| BI Clinical Notes | ~197.8M | **In progress** | `philter-deidentify/bi_clinical_notes_output/partition_{0-19}/` |
 
 ---
 
@@ -104,6 +105,33 @@ Each EC2 instance runs **60 parallel workers** via `multiprocessing.Pool` with `
 | `ReportTXT` | string | **De-identified imaging report text** |
 | `de_id_filename` | string | Filename key |
 
+**Status CSV columns:** `OrderProcedureID`, `de_id_filename`, `status`
+
+### BI Clinical Notes (`--note-type bi_clinicalnotes`)
+
+**Input columns (from S3):**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `CLINICALNOTETEXTKEY` | string | Clinical note text key (ID) |
+| `TYPE` | string | Note type |
+| `SHIFTED_CREATIONINSTANT` | timestamp[ns] | Date-shifted creation timestamp |
+| `TEXT` | string | **Clinical note text (to be de-identified)** |
+| `COUNT` | decimal128(38,0) | Record count |
+| `DeidentifiedName` | string | Filename key used by Philter |
+
+**Output columns:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `DeidentifiedName` | string | Filename key |
+| `TEXT` | string | **De-identified clinical note text** |
+| `TYPE` | string | Note type |
+| `CREATIONINSTANT` | timestamp[ns] | Creation timestamp (renamed from `SHIFTED_CREATIONINSTANT`) |
+| `COUNT` | decimal128(38,0) | Record count |
+
+**Status CSV columns:** `CLINICALNOTETEXTKEY`, `DeidentifiedName`, `status`
+
 ---
 
 ## S3 Layout
@@ -121,18 +149,24 @@ s3://bdsp-site-mgb/
 │   └── Notes_parquet_24/
 ├── I0001_ImagingReports/                           ← INPUT: imaging reports (96 files flat)
 ├── I0001_ClinicalNotes_Missed/                     ← INPUT: missed clinical notes (200 files flat)
+├── bi_clinical_notes/                              ← INPUT: BI clinical notes (20 files flat, ~197.8M records)
 └── philter-deidentify/
     ├── config/philter_one.json                     ← Philter config (uploaded by deploy scripts)
     ├── output/                                     ← Clinical notes output (original run)
     ├── imaging_output/
     │   ├── partition_0/                            ← Imaging report output (20 partitions)
     │   │   ├── batch_000001.parquet
-    │   │   ├── batch_000002.parquet
     │   │   └── checkpoint.json
     │   ├── partition_1/ ... partition_19/
     │   └── logs/partition_X_complete.log           ← Completion markers
-    └── missed_notes_output/
-        ├── partition_0/                            ← Missed notes output (20 partitions)
+    ├── missed_notes_output/
+    │   ├── partition_0/                            ← Missed notes output (20 partitions)
+    │   │   ├── batch_000001.parquet
+    │   │   └── checkpoint.json
+    │   ├── partition_1/ ... partition_19/
+    │   └── logs/partition_X_complete.log
+    └── bi_clinical_notes_output/
+        ├── partition_0/                            ← BI clinical notes output (20 partitions)
         │   ├── batch_000001.parquet
         │   └── checkpoint.json
         ├── partition_1/ ... partition_19/
@@ -234,8 +268,11 @@ Each deploy script handles everything automatically: packages the code, uploads 
 **For a new dataset run, use the appropriate script:**
 
 ```bash
-# Missed clinical notes (most recent run)
-./deploy_missed_notes.sh i-0aaa... i-0bbb... i-0ccc...   # pass all instance IDs
+# BI clinical notes
+./deploy_bi_clinical_notes.sh i-0aaa... i-0bbb... i-0ccc...   # pass all instance IDs
+
+# Missed clinical notes
+./deploy_missed_notes.sh i-0aaa... i-0bbb... i-0ccc...
 
 # Imaging reports
 ./deploy_imaging.sh i-0aaa... i-0bbb...
@@ -252,7 +289,7 @@ Each deploy script handles everything automatically: packages the code, uploads 
 4. Downloads and extracts the project tarball from S3
 5. Installs Python dependencies (`pyarrow`, `pandas`, `boto3`, `s3fs`, `nltk`)
 6. Writes a `start_watchdog.sh` script that wraps the Python process in a restart loop
-7. Starts the watchdog via `nohup` as a detached background process
+7. Starts the watchdog via `setsid` as a detached background process (survives SSH disconnect)
 
 **The watchdog loop (how crash recovery works):**
 
@@ -305,9 +342,9 @@ python3.9 process_parquet_aws.py \
     --note-type clinicalnotes \
     --philter-config configs/philter_one.json
 
-# OR: run with watchdog for auto-restart
-nohup bash start_watchdog.sh > ~/deidentify.log 2>&1 &
-disown
+# OR: run with watchdog for auto-restart (setsid creates new session, survives SSH disconnect)
+setsid bash start_watchdog.sh > ~/deidentify.log 2>&1 &
+sleep 3
 ```
 
 **`process_parquet_aws.py` argument reference:**
@@ -321,7 +358,7 @@ disown
 | `--batch-size` | Records per sub-batch sent to workers | `10000` |
 | `--file-start` | Index of first file to process (0-based, inclusive) | `0` |
 | `--file-end` | Index of last file to process (exclusive) | `10` |
-| `--note-type` | `clinicalnotes` (NoteTXT/NoteCSNID) or `imagingreport` (ReportTXT/OrderProcedureID) | `clinicalnotes` |
+| `--note-type` | `clinicalnotes` (NoteTXT/NoteCSNID), `imagingreport` (ReportTXT/OrderProcedureID), or `bi_clinicalnotes` (TEXT/CLINICALNOTETEXTKEY) | `clinicalnotes` |
 | `--philter-config` | Path to Philter JSON config | `configs/philter_one.json` |
 
 ### 4. Monitor Progress
@@ -421,6 +458,28 @@ Expected: ≥99% records de-identified, output `ReportTXT`/`NoteTXT` contains `*
 
 ## Deploy Scripts Reference
 
+### `deploy_bi_clinical_notes.sh` — BI Clinical Notes
+
+Deploys to N instances for processing `bi_clinical_notes/` (20 files × ~8.67M rows = ~197.8M records).
+
+```bash
+./deploy_bi_clinical_notes.sh i-0aaa... i-0bbb... [more instance IDs...]
+```
+
+Key config inside the script:
+```bash
+BUCKET="bdsp-site-mgb"
+INPUT_PREFIX="bi_clinical_notes/"
+OUTPUT_PREFIX="philter-deidentify/bi_clinical_notes_output"
+NUM_WORKERS=60
+TOTAL_FILES=20
+NOTE_TYPE="bi_clinicalnotes"
+```
+
+File range split: 1 file per instance (20 files → 20 instances). Each instance processes `--file-start i --file-end i+1`.
+
+---
+
 ### `deploy_missed_notes.sh` — Missed Clinical Notes
 
 Deploys to N instances for processing `I0001_ClinicalNotes_Missed/` (200 files × ~544K rows = ~108.8M records).
@@ -503,7 +562,7 @@ All Parquet files are read directly from S3 using `pyarrow.dataset` and written 
 Every instance runs a watchdog shell loop that restarts the Python process on any crash (OOM, spot interruption, network error). The Python process reads `checkpoint.json` from S3 on startup and skips already-completed files.
 
 ```
-start_watchdog.sh (background, detached via nohup)
+start_watchdog.sh (background, detached via setsid — survives SSH disconnect)
   └── process_parquet_aws.py (restarted on crash)
         └── checkpoint.json (S3, tracks completed files)
 ```
@@ -574,10 +633,9 @@ ssh -i /path/to/philter.pem ec2-user@<ip> << 'EOF'
 pkill -f start_watchdog.sh
 pkill -f process_parquet_aws.py
 sleep 3
-# Restart
-cd ~/philter-plus-deidentification
-nohup bash start_watchdog.sh > ~/deidentify.log 2>&1 &
-disown
+# Restart (setsid ensures process survives SSH disconnect)
+setsid bash ~/start_watchdog.sh > ~/deidentify.log 2>&1 &
+sleep 3
 echo "Restarted"
 EOF
 ```
@@ -594,12 +652,13 @@ EOF
 | EBS (50 GB × 20 instances) | $0.08/GB-month | ~$2/day |
 | S3 requests + transfer | — | ~$10-20 |
 
-Estimated runtimes at ~120 rec/sec per instance:
+Estimated runtimes at ~90–120 rec/sec per instance:
 
-| Dataset | Records | Instances | Est. Runtime | Est. Cost |
+| Dataset | Records | Instances | Est. Runtime | Est. Cost (on-demand) |
 |---------|---------|-----------|--------------|-----------|
-| Imaging Reports | 47.6M | 20 | ~1.7 hours | **~$25** |
-| Missed Clinical Notes | 108.8M | 20 | ~4 hours | **~$55** |
+| Imaging Reports | 47.6M | 20 | ~1.7 hours | **~$92** |
+| Missed Clinical Notes | 108.8M | 20 | ~12 hours | **~$653** |
+| BI Clinical Notes | 197.8M | 20 | ~27 hours | **~$1,469** |
 
 ### Previous Architecture (for reference)
 
@@ -620,10 +679,11 @@ The original clinical notes run used SSO credentials written to instances (11 ×
 
 | File | Description |
 |------|-------------|
+| `deploy_bi_clinical_notes.sh` | Deploy BI clinical notes run to N instances (20 files, 1/instance) |
 | `deploy_missed_notes.sh` | Deploy missed clinical notes run to N instances |
 | `deploy_imaging.sh` | Deploy imaging reports run to N instances |
 | `deploy_aws.sh` | Deploy original clinical notes run to N instances |
-| `process_parquet_aws.py` | Main de-id script — reads from S3, de-identifies, writes to S3. Accepts `--note-type clinicalnotes\|imagingreport`, `--file-start`/`--file-end` for range splitting |
+| `process_parquet_aws.py` | Main de-id script — reads from S3, de-identifies, writes to S3. Accepts `--note-type clinicalnotes\|imagingreport\|bi_clinicalnotes`, `--file-start`/`--file-end` for range splitting |
 | `generate_stats.py` | Post-run verification — compares input record count vs output. Accepts `--note-type` |
 | `extract_not_deidentified.py` | Extracts records not present in output (for re-run). Used after original clinical notes run |
 | `run_extract.sh` | Shell wrapper to run `extract_not_deidentified.py` |
