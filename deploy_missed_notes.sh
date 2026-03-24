@@ -270,6 +270,10 @@ while true; do
     echo ""
     echo "--- Attempt \$ATTEMPT started at \$(date) ---"
 
+    # Kill orphaned workers from previous crash before restarting
+    pkill -9 -f "process_parquet_aws" 2>/dev/null || true
+    sleep 2
+
     \$PYTHON process_parquet_aws.py \
         --input-path  "s3://${BUCKET}/${INPUT_PREFIX}" \
         --output-path "s3://${BUCKET}/${OUTPUT_PREFIX}/partition_${i}/" \
