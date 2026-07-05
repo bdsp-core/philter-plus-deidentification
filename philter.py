@@ -1393,6 +1393,18 @@ class Philter:
             for m in re.finditer(r"\b([A-Z]{2})\b(?=[ \t]+\d{5}(?:-\d{4})?\b)", txt):
                 if m.group(1) in _STA:
                     state_spans[m.start(1)] = m.end(1)
+        # WORD-FORM DATES ("November 25, 2024", "Nov 25 2024", "25 November 2024", "November 2024") are
+        # frequently MISSED by Philter's numeric date rules -> they would leak an unshifted real date.
+        # Detect them here and shift by the per-note offset (same as numeric dates).
+        _MON = (r"(?:January|February|March|April|May|June|July|August|September|October|November|"
+                r"December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)")
+        word_date = re.compile(
+            rf"\b{_MON}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}\b"     # Month DD, YYYY
+            rf"|\b\d{{1,2}}(?:st|nd|rd|th)?\s+{_MON}\.?,?\s+\d{{4}}\b"    # DD Month YYYY
+            rf"|\b{_MON}\.?\s+\d{{4}}\b", re.I)                          # Month YYYY
+        word_date_spans = {}
+        for m in word_date.finditer(txt):
+            word_date_spans[m.start()] = m.end()
         punctuation_matcher = re.compile(r"[^a-zA-Z0-9*]")
         alpha_run = re.compile(r"[A-Za-z][A-Za-z'\-]*")
         digit_run = re.compile(r"\d+")
@@ -1421,6 +1433,10 @@ class Philter:
             if i in state_spans and surrogate_places is not None:   # STATE abbrev -> fake state
                 stop = state_spans[i]
                 contents.append(surrogate_places._fake_state(txt[i:stop]) or txt[i:stop])
+                i = last_marker = stop; continue
+            if i in word_date_spans:                                # WORD-FORM DATE -> shifted date
+                stop = word_date_spans[i]
+                contents.append(self._shift_date_str(txt[i:stop], shift_days))
                 i = last_marker = stop; continue
             if i in known_spans and surrogate_names is not None:    # KNOWN real name -> surrogate
                 stop = known_spans[i]
@@ -1560,7 +1576,11 @@ class Philter:
             import dateparser
             d = dateparser.parse(s)
             if d and shift_days != 0:
-                return (d + _dt.timedelta(days=shift_days)).strftime("%B %d, %Y")
+                shifted = d + _dt.timedelta(days=shift_days)
+                # month-year input ("March 2020", no day) -> keep month-year granularity, don't invent a day
+                if re.fullmatch(r"[A-Za-z]{3,9}\.?\s+\d{4}", s):
+                    return shifted.strftime("%B %Y")
+                return shifted.strftime("%B %d, %Y")
         except Exception:
             pass
         # unparseable "date" tokens are almost always ID-like (case/specimen numbers Philter mis-tagged
