@@ -81,7 +81,23 @@ class Philter:
         
         if "ucsfformat" in config:
             self.ucsf_format = config["ucsfformat"]
-       
+
+        # Per-patient date shift for the "surrogate" output format: DATE spans are replaced with
+        # the real date shifted by this many days (the canonical per-patient offset), not asterisks.
+        # `date_shifts` may be an inline {filename_basename: days} dict or a path to such a JSON;
+        # `default_date_shift` applies when a file has no entry.
+        self.date_shifts = {}
+        self.default_date_shift = int(config.get("default_date_shift", 0))
+        _ds = config.get("date_shifts")
+        if isinstance(_ds, dict):
+            self.date_shifts = _ds
+        elif isinstance(_ds, str) and os.path.exists(_ds):
+            self.date_shifts = json.loads(open(_ds).read())
+
+        if "known_names" in config:
+            self.known_names_path = config["known_names"]
+
+
         if "filters" in config:
             if not os.path.exists(config["filters"]):
                 raise Exception("Filepath does not exist", config["filters"])
@@ -1113,6 +1129,11 @@ class Philter:
                     contents = self.transform_text_asterisk(txt, filename)
                     f.write(contents)
                     
+            elif self.outformat == "surrogate":
+                with open(outpathfbase+".txt", "w", encoding='utf-8', errors='surrogateescape') as f:
+                    contents = self.transform_text_surrogate(txt, filename)
+                    f.write(contents)
+
             elif self.outformat == "i2b2":
                 with open(outpathfbase+".xml", "w", errors='xmlcharrefreplace') as f: #TODO: should we have an explicit encoding?
                     contents = self.transform_text_i2b2(self.data_all_files[filename])
@@ -1148,6 +1169,415 @@ class Philter:
                 contents.append("*")
 
         return "".join(contents)
+
+    def transform_text_surrogate(self, txt, infilename):
+        """Surrogate output (hiding-in-plain-sight): DATE spans -> the real date SHIFTED by the
+        patient's canonical offset (not asterisks); all other PHI -> asterisks; every non-PHI
+        character (including whitespace and line breaks) is kept verbatim, so note formatting is
+        preserved. Never emits an unshifted real date: an unparseable DATE span falls back to
+        asterisks."""
+        date_spans = {}
+        for cm in self.phi_type_dict.get("DATE", []):
+            for start, stop in cm.filecoords(infilename):
+                date_spans[start] = stop
+        name_spans = {}
+        for cm in self.phi_type_dict.get("NAME", []):
+            for start, stop in cm.filecoords(infilename):
+                name_spans[start] = stop
+        place_spans = {}
+        for ptype in ("LOCATION", "TOWN"):
+            for cm in self.phi_type_dict.get(ptype, []):
+                for start, stop in cm.filecoords(infilename):
+                    place_spans[start] = stop
+        # KNOWN-NAME INJECTION: names from the structured record (patient + providers) are surrogated
+        # by identity, not by guessing -> catches names the NER misses (e.g. non-Western names).
+        known_spans = {}
+        if not hasattr(self, "known_names"):
+            self.known_names = {}
+            import json as _json2
+            kp = getattr(self, "known_names_path", None)
+            if kp:
+                try:
+                    self.known_names = _json2.loads(open(kp, encoding="utf-8").read())
+                except Exception:
+                    self.known_names = {}
+        _toks = self.known_names.get(os.path.basename(infilename), [])
+        for _t in _toks:
+            if len(_t) >= 2:
+                for m in re.finditer(r"(?<![A-Za-z])" + re.escape(_t) + r"(?![A-Za-z])", txt, re.I):
+                    if not m.group(0)[:1].isupper():      # a real name is Capitalized; a lowercase match is
+                        continue                          # a common-word collision ("Will" the name vs "will")
+                    known_spans[m.start()] = m.end()
+        # multi-word place names ("Palo Alto", "Mountain View"): Philter often tags only the first token,
+        # leaving the dictionary-word second token ("Alto"/"View") to be restored by the guard. Extend a
+        # place span over up to two immediately-following Capitalized words so the whole city is faked as a
+        # unit -- but never absorb an all-caps state abbrev or a known/NER-tagged name.
+        for _st in list(place_spans):
+            _sp = place_spans[_st]
+            for _ in range(2):
+                _m = re.match(r"[ \t]+([A-Z][a-z]+)\b", txt[_sp:])
+                if not _m:
+                    break
+                _ns = _sp + _m.start(1)
+                if _ns in known_spans or _ns in name_spans:
+                    break
+                _sp = _sp + _m.end()
+                place_spans[_st] = _sp
+        # CITY, STATE ZIP address pattern ("Palo Alto CA 94304"): treat the 1-3 word city as a LOCATION
+        # unit even when Philter mis-tagged its first token as a NAME -- so the whole city is faked as a
+        # place (not "Sietsma Alto"). The city's tokens then override any NAME tag / dictionary-restore.
+        for _m in re.finditer(r"\b([A-Z][a-z]+(?:[ \t][A-Z][a-z]+){0,2}),?[ \t]+[A-Z]{2}[ \t]+\d{5}\b", txt):
+            place_spans[_m.start(1)] = _m.end(1)
+            for _ks in [k for k in name_spans if _m.start(1) <= k < _m.end(1)]:
+                del name_spans[_ks]                     # city word wrongly tagged as a name -> drop the name tag
+        place_char = set()                              # every position inside a place span (used by the guard)
+        for _ps, _pe in place_spans.items():
+            place_char.update(range(_ps, _pe))
+        try:
+            import surrogate_names
+        except Exception:
+            surrogate_names = None
+        try:
+            import surrogate_places
+        except Exception:
+            surrogate_places = None
+        shift_days = int(self.date_shifts.get(os.path.basename(infilename),
+                                              self.default_date_shift))
+        # WHITELIST-RESTORE GUARD (case-aware): keep a PHI-tagged word whose text is known-safe,
+        # regardless of Philter's internal include/exclude precedence. Names in clinical notes are
+        # capitalized mid-sentence, so: a general dictionary word is restored only when lowercase or
+        # sentence-initial (never a mid-sentence Capitalized token, which could be a name); a CURATED
+        # medical term (biomarker/organism/lab word) is restored in any case. Fast: sets load once.
+        if not hasattr(self, "_safe_lower"):
+            import json as _json, os as _os
+            base = _os.path.dirname(_os.path.abspath(__file__))
+            def _load(fn):
+                try:
+                    d = _json.loads(open(_os.path.join(base, fn), encoding="utf-8").read())
+                    return set(k.lower() for k in (d.keys() if isinstance(d, dict) else d))
+                except Exception:
+                    return set()
+            self._safe_lower = _load("filters/whitelists/whitelist_stanford_medical.json")
+            self._safe_any = _load("filters/whitelists/whitelist_medical_anycase.json")
+            # English stopwords / function words are NEVER PHI, but the medical dictionary omits many
+            # short ones ("of", "to", "in"); without this, a function word Philter mis-tags (e.g. the
+            # "of" in an "X of Y" org pattern) falls through to the fake-name fallback ("of" -> "edele").
+            _stop = {"of","to","in","is","as","or","an","on","by","at","it","be","he","we","do","if","so",
+                     "no","up","my","me","us","the","and","for","are","was","not","but","has","had","his",
+                     "her","she","him","its","our","out","who","you","all","any","can","did","been","were",
+                     "with","that","this","from","they","have","will","would","there","their","which","when",
+                     "what","your","them","then","than","into","over","such","only","some","more","most",
+                     "other","about","after","before","between","during","while","because","depending"}
+            try:
+                from nltk.corpus import stopwords as _sw
+                _stop |= set(_sw.words("english"))
+            except Exception:
+                pass
+            self._safe_lower |= _stop
+            # "safe" regexes (BP/ratios, genomic coordinates, age) are Philter include-rules, but the
+            # surrogate guard cannot rely on Philter's include/exclude precedence -- so apply them here
+            # directly. Same clinical values Philter's date/id patterns would otherwise over-redact.
+            self._safe_rx = []
+            for _rf in ("clinical_ratios_safe.txt", "genomic_coords_safe.txt",
+                        "age_demographic_safe.txt", "bp_safe.txt"):
+                try:
+                    self._safe_rx.append(re.compile(
+                        open(_os.path.join(base, "filters/regex/safe", _rf), encoding="utf-8").read().strip()))
+                except Exception:
+                    pass
+            # census name set: the gate for restoring Capitalized dictionary words. A word that is
+            # also a name (Vera/Yang/Rishi) stays redacted even when capitalized; a common word that
+            # is NOT a name (Laboratory/Negative/Impression) is restored in any case.
+            self._names = _load("filters/blacklists/firstnames_minus_fps.json") | \
+                          _load("filters/blacklists/lastnames_minus_fps.json")
+        safe_char = set()
+        if self._safe_lower or self._safe_any:
+            def _restore(tok, start, end):
+                # restore if: a curated medical term (any case); OR a lowercase dictionary word (never a
+                # name in that use); OR a Capitalized dictionary word that is NOT a known name -- common
+                # report words like "Laboratory"/"Negative"/"Impression" must survive, but a word that
+                # doubles as a name (Vera/Yang) stays redacted (and structured names are surrogated).
+                w = re.sub(r"[^a-z0-9]", "", tok.lower())
+                if not w:
+                    return
+                if w in self._safe_any:                          # curated medical term -> keep even in a place
+                    safe_char.update(range(start, end)); return
+                if start in place_char:                          # a dictionary word INSIDE a place span
+                    return                                       # ("Alto" of "Palo Alto") -> let it be faked
+                if w in self._safe_lower and (tok[0].islower() or w not in self._names):
+                    safe_char.update(range(start, end))
+            # pass A: the whole hyphen/apostrophe compound as blessed (Ki-67, Ber-EP4, tilt-table).
+            for m in re.finditer(r"[A-Za-z][A-Za-z0-9'\-]*", txt):
+                _restore(m.group(0), m.start(), m.end())
+            # pass B: each alphanumeric sub-run, so a compound of ordinary words has each part restored
+            # (Laboratory-developed -> Laboratory + developed) with the hyphen kept as punctuation.
+            for m in re.finditer(r"[A-Za-z][A-Za-z0-9]*", txt):
+                _restore(m.group(0), m.start(), m.end())
+            # clinical-ratio / genomic / age "safe" regexes -> keep (BP 152/64, 15q11.2, 66F...)
+            for _rx in getattr(self, "_safe_rx", []):
+                for m in _rx.finditer(txt):
+                    safe_char.update(range(m.start(), m.end()))
+            # clinical measurements -> keep: dimensions ("1.5 x 2.0", "15x10x8"), standalone decimals
+            # ("2.5", dose/size), and 0-10 pain/severity scores ("7/10").
+            for m in re.finditer(r"(?<![\w.])\d+(?:\.\d+)?(?:\s*[xX]\s*\d+(?:\.\d+)?){1,2}(?![\w])|"
+                                 r"(?<![\d.])\d{1,3}\.\d{1,2}(?![\d.])|"
+                                 r"(?<![\d/])(?:10|[0-9])/10(?![\d/])", txt):
+                safe_char.update(range(m.start(), m.end()))
+            # units of measure are never PHI -> keep (protects "0.8 cm", "500 mg" from the surrogate
+            # fallback that would otherwise turn a stray-tagged unit into a fake word).
+            for m in re.finditer(r"(?<![A-Za-z])(?:mm|cm|km|kg|mg|mcg|ug|ng|ml|dl|cc|oz|lb|iu|meq|mmol|"
+                                 r"mmHg|mmhg|bpm|rpm|Hz|kV|mV|nm|um|Gy|cGy|mCi|kcal|cm2|mm2|mm3|cm3)"
+                                 r"(?![A-Za-z])", txt):
+                safe_char.update(range(m.start(), m.end()))
+            # bare 1-3 digit numbers are vitals/labs/counts, never identifying -> keep (protects tables)
+            for m in re.finditer(r"(?<![\w./])\d{1,3}(?![\w./])", txt):
+                safe_char.update(range(m.start(), m.end()))
+            # all-caps clinical acronyms (QSART, SBP, DBP, HRDB, UCNS...) -> keep, UNLESS the token is a
+            # known name (those are surrogated first via known_spans, so this can't keep a known name)
+            for m in re.finditer(r"\b[A-Z][A-Z0-9]{1,}\b", txt):
+                if m.start() not in known_spans:
+                    safe_char.update(range(m.start(), m.end()))
+            # stat / measurement / directional abbreviations written WITH a trailing period ("Max.",
+            # "Min.", "Post.") are labels, not names -- keep them (the period disambiguates from the
+            # bare name "Max"; and an actual patient named Max is surrogated first via known_spans).
+            _statabbr = (r"\b(?:Max|Min|Avg|Med|Std|Sup|Inf|Ant|Post|Lat|Prox|Dist|Sag|Cor|Vol|Freq|"
+                         r"Amp|Dur|Ref|Est|Approx|Rel|Abs|Sys|Dia|Dias|Seg|Ext|Flex|Vel|Grad|Circ|"
+                         r"Diam|Len|Wt|Ht|Temp|Resp|Vert|Horiz|Obl|Trans|Long|Sup|Ing|Calc)\.")
+            for m in re.finditer(_statabbr, txt):
+                if m.start() not in known_spans:
+                    safe_char.update(range(m.start(), m.end() - 1))   # keep the letters (period is punctuation)
+            # mixed-case technical tokens with an internal capital (iSK, mRNA, pTNM, cT2, HbA1c) are
+            # medical shorthand, never personal names -> keep.
+            for m in re.finditer(r"\b[a-z][A-Z][A-Za-z0-9]*\b", txt):
+                if m.start() not in known_spans:
+                    safe_char.update(range(m.start(), m.end()))
+        # ACCESSION / SPECIMEN NUMBERS are PHI identifiers. Match the WHOLE prefix-YY-NNNNN (or PREFIXdigits)
+        # shape as a unit BEFORE tokenizing, and replace it with a deterministic FAKE accession of the same
+        # shape — so the all-caps prefix guard can't keep the prefix, and no asterisks are emitted.
+        accession = re.compile(r"\b(?:[A-Z]{2,5}\d{0,2}-\d{2}-\d{3,7}|[A-Z]{2,5}\d{2}-\d{4,8}|"
+                               r"(?:MSUR|MSR|CYG|CY|SH[A-Z]|SP|SN|OS|CB)\d{6,10})\b")
+        accession_spans = {}
+        for m in accession.finditer(txt):
+            accession_spans[m.start()] = m.end()
+        # PHONE / FAX numbers -> a deterministic FAKE phone (hiding in plain sight), matched as a WHOLE
+        # unit before the bare-number guard can keep the area code / exchange.
+        phone = re.compile(r"(?:\+?1[-.\s])?(?:\(\d{3}\)\s?|\d{3}[-.\s])\d{3}[-.\s]\d{4}\b")
+        phone_spans = {}
+        for m in phone.finditer(txt):
+            phone_spans[m.start()] = m.end()
+        # EMAIL -> deterministic fake email (fake domain, generic mailboxes like noreply kept).
+        email = re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b")
+        email_spans = {}
+        for m in email.finditer(txt):
+            email_spans[m.start()] = m.end()
+        # WEBSITE / URL -> deterministic fake domain (TLD kept, path dropped). TLD-gated so it can't
+        # swallow ordinary abbreviations ("e.g.", "St.John").
+        url = re.compile(r"\b(?:https?://|www\.)?[a-zA-Z0-9][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9-]+)*"
+                         r"\.(?:com|org|net|edu|gov|io|co|us|info|health|care|clinic|md)(?:/[^\s]*)?",
+                         re.I)
+        url_spans = {}
+        for m in url.finditer(txt):
+            if m.start() not in email_spans:               # an email's domain is handled by email
+                url_spans[m.start()] = m.end()
+        # STATE abbreviation in a geographic context ("City, TX" / "TX 94305") -> fake state. Matched as
+        # a unit here so the all-caps guard can't keep "TX" verbatim. Gated to comma-or-ZIP context.
+        state_spans = {}
+        if surrogate_places is not None:
+            _STA = set(surrogate_places.STATE_ABBR)
+            # 2-letter tokens that are BOTH state abbreviations and common medical credentials/roles: only
+            # treat as a state when a ZIP anchors it (never swap "Kelly Lynn, MD" -> a fake state).
+            _CRED = {"MD", "DO", "PA", "DC", "ND", "VA"}
+            for m in re.finditer(r",[ \t]*([A-Z]{2})\b(?=[ \t]+\d{5}(?:-\d{4})?\b|[ \t]*(?:[\n;)]|$))", txt):
+                if m.group(1) in _STA and m.group(1) not in _CRED:
+                    state_spans[m.start(1)] = m.end(1)
+            for m in re.finditer(r"\b([A-Z]{2})\b(?=[ \t]+\d{5}(?:-\d{4})?\b)", txt):
+                if m.group(1) in _STA:
+                    state_spans[m.start(1)] = m.end(1)
+        punctuation_matcher = re.compile(r"[^a-zA-Z0-9*]")
+        alpha_run = re.compile(r"[A-Za-z][A-Za-z'\-]*")
+        digit_run = re.compile(r"\d+")
+        contents = []
+        i, N, last_marker = 0, len(txt), 0
+        while i < N:
+            if i < last_marker:
+                i += 1
+                continue
+            if i in accession_spans:                                # accession/specimen id -> fake (wins over guard)
+                stop = accession_spans[i]
+                contents.append(self._fake_accession(txt[i:stop]))
+                i = last_marker = stop; continue
+            if i in phone_spans:                                    # PHONE -> fake phone
+                stop = phone_spans[i]
+                contents.append(self._fake_phone(txt[i:stop]))
+                i = last_marker = stop; continue
+            if i in email_spans:                                    # EMAIL -> fake email
+                stop = email_spans[i]
+                contents.append(self._fake_email(txt[i:stop]))
+                i = last_marker = stop; continue
+            if i in url_spans:                                      # WEBSITE -> fake domain
+                stop = url_spans[i]
+                contents.append(self._fake_url(txt[i:stop]))
+                i = last_marker = stop; continue
+            if i in state_spans and surrogate_places is not None:   # STATE abbrev -> fake state
+                stop = state_spans[i]
+                contents.append(surrogate_places._fake_state(txt[i:stop]) or txt[i:stop])
+                i = last_marker = stop; continue
+            if i in known_spans and surrogate_names is not None:    # KNOWN real name -> surrogate
+                stop = known_spans[i]
+                contents.append(surrogate_names.fake_name_span(txt[i:stop], txt[max(0, i-6):i]))
+                i = last_marker = stop; continue
+            if i in safe_char:                                      # known-safe medical/dict/number -> keep
+                contents.append(txt[i]); i += 1; continue
+            if self.include_map.does_exist(infilename, i):          # whitelisted/safe -> keep
+                start, stop = self.include_map.get_coords(infilename, i)
+                # an include range must never SWALLOW an identity-verified real name that falls inside it
+                # (Philter may mark a signature-block surname "safe"); clamp to the next known-name start.
+                nxt = min((k for k in known_spans if i < k < stop), default=stop)
+                contents.append(txt[i:nxt]); i = last_marker = nxt; continue
+            if i in date_spans:                                     # DATE -> shifted date
+                stop = date_spans[i]
+                contents.append(self._shift_date_str(txt[i:stop], shift_days))
+                i = last_marker = stop; continue
+            if i in name_spans and surrogate_names is not None:      # NAME -> gendered fake name
+                stop = name_spans[i]
+                contents.append(surrogate_names.fake_name_span(txt[i:stop], txt[max(0, i-6):i]))
+                i = last_marker = stop; continue
+            if i in place_spans and surrogate_places is not None:    # LOCATION/TOWN -> fake place
+                stop = place_spans[i]
+                contents.append(surrogate_places.fake_place_span(txt[i:stop]))
+                i = last_marker = stop; continue
+            # FALLBACK for PHI that matched no specific surrogate category: minimize asterisks -- replace
+            # an alphabetic run with a fake proper noun and a digit run with fake digits, so the note
+            # reads naturally (only genuinely un-typed leftovers ever become "*").
+            am = alpha_run.match(txt, i)
+            if am and surrogate_names is not None:
+                tok = am.group(0)
+                contents.append(surrogate_names.fake_name_span(tok, txt[max(0, i-8):i]))
+                i = last_marker = am.end(); continue
+            dm = digit_run.match(txt, i)
+            if dm:
+                contents.append(self._fake_digits(dm.group(0)))
+                i = last_marker = dm.end(); continue
+            ch = txt[i]
+            contents.append(ch if punctuation_matcher.match(ch) else "*")
+            i += 1
+        return "".join(contents)
+
+    # -- deterministic "hiding in plain sight" surrogates for contact identifiers (phone/email/website).
+    #    Same input -> same fake, keyed by SURROGATE_SALT; not reversible without the salt.
+    _DOMWORDS = ("bright river summit cedar harbor maple valley crest haven ridge grove brookside "
+                 "lakeside parkview meadow stonegate pinehurst vista clearwater fairmont").split()
+    _DOMSUFX = "care health clinic medical group wellness family associates partners center".split()
+
+    def _sur_digest(self, tag, s):
+        import hmac, hashlib, os
+        salt = os.environ.get("SURROGATE_SALT", "philter-surrogate-v1").encode()
+        return hmac.new(salt, (tag + ":" + s.lower()).encode("utf-8", "ignore"), hashlib.sha256).digest()
+
+    def _fake_phone(self, orig):
+        """Replace a phone/fax with a deterministic fake, preserving the exact punctuation/format and
+        forcing valid-looking NPA/NXX leading digits (2-9)."""
+        h = self._sur_digest("phone", orig)
+        digs = [str(b % 10) for b in h]
+        out, di = [], 0
+        for ch in orig:
+            if ch.isdigit():
+                d = digs[di % len(digs)]
+                if di in (0, 3) and d in "01":            # area code / exchange must not start 0 or 1
+                    d = str(2 + (h[di] % 8))
+                out.append(d); di += 1
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    def _fake_digits(self, s):
+        """Deterministic fake digit string, same length as `s` (for un-typed numeric identifiers that
+        would otherwise be asterisked)."""
+        h = self._sur_digest("id", s)
+        return "".join(str(h[k % len(h)] % 10) for k in range(len(s)))
+
+    def _fake_accession(self, orig):
+        """Deterministic fake accession/specimen id -- fakes letters and digits, keeps the exact format
+        (separators, case), so PREFIX-YY-NNNNN reads as a plausible accession instead of asterisks."""
+        h = self._sur_digest("acc", orig)
+        out, k = [], 0
+        for ch in orig:
+            if ch.isdigit():
+                out.append(str(h[k % len(h)] % 10)); k += 1
+            elif ch.isalpha():
+                c = h[k % len(h)] % 26
+                out.append(chr(ord('A') + c) if ch.isupper() else chr(ord('a') + c)); k += 1
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    def _fake_domain(self, label):
+        h = self._sur_digest("dom", label)
+        w1 = self._DOMWORDS[int.from_bytes(h[0:4], "big") % len(self._DOMWORDS)]
+        w2 = self._DOMSUFX[int.from_bytes(h[4:8], "big") % len(self._DOMSUFX)]
+        return w1 + w2
+
+    def _fake_email(self, orig):
+        import re as _re
+        m = _re.match(r"([^@]+)@(.+)", orig)
+        if not m:
+            return "*" * len(orig)
+        local, domain = m.group(1), m.group(2)
+        tld = domain.rsplit(".", 1)[1] if "." in domain else "com"
+        generic = {"noreply", "no-reply", "donotreply", "info", "admin", "support",
+                   "contact", "help", "office", "billing", "scheduling"}
+        loc = local if local.lower() in generic else self._DOMWORDS[
+            int.from_bytes(self._sur_digest("eml", local)[0:4], "big") % len(self._DOMWORDS)]
+        return loc + "@" + self._fake_domain(domain) + "." + tld
+
+    def _fake_url(self, orig):
+        import re as _re
+        m = _re.match(r"(https?://|www\.)?(.*)", orig, _re.I)
+        scheme, rest = (m.group(1) or ""), m.group(2)
+        host = _re.match(r"[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*", rest).group(0)
+        tld = host.rsplit(".", 1)[1] if "." in host else "com"
+        return scheme + self._fake_domain(host) + "." + tld   # path dropped (may carry portal tokens)
+
+    def _shift_date_str(self, orig, shift_days):
+        """Return `orig` (a detected date) shifted by shift_days, rendered in the same numeric
+        format where possible. Falls back to asterisks if the date can't be parsed OR no shift is
+        known (shift_days == 0), so a real date is never emitted unshifted."""
+        import datetime as _dt
+        s = orig.strip()
+        numeric_fmts = ["%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
+                        "%Y-%m-%d", "%m.%d.%Y", "%m.%d.%y", "%m/%d", "%m-%d"]
+        for fmt in numeric_fmts:
+            try:
+                d = _dt.datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+            if shift_days == 0:
+                return "*" * len(orig)              # no known shift -> do not leak the real date
+            shifted = (d + _dt.timedelta(days=shift_days)).strftime(fmt)
+            return orig.replace(s, shifted) if s in orig else shifted
+        # word dates (e.g. "March 4, 2019") via dateparser
+        try:
+            import dateparser
+            d = dateparser.parse(s)
+            if d and shift_days != 0:
+                return (d + _dt.timedelta(days=shift_days)).strftime("%B %d, %Y")
+        except Exception:
+            pass
+        # unparseable "date" tokens are almost always ID-like (case/specimen numbers Philter mis-tagged
+        # as dates, e.g. "12-34-5678"): fake the digits (never leaks the real value, avoids asterisks).
+        if any(c.isdigit() for c in orig):
+            return self._fake_accession(orig)
+        # purely alphabetic "date" token: a bare season / time-of-day / relative word is NOT a HIPAA date
+        # element (no day/month/year), so keep it ("winter months", "morning"); only a lone month or
+        # holiday name (an actual date element) is redacted.
+        low = s.lower()
+        _MONTHS = {"january","february","march","april","may","june","july","august","september",
+                   "october","november","december","jan","feb","mar","apr","jun","jul","aug","sep",
+                   "sept","oct","nov","dec"}
+        _HOLIDAYS = {"christmas","thanksgiving","easter","hanukkah","halloween","new year","new years"}
+        if low in _MONTHS or low in _HOLIDAYS:
+            return "*" * len(orig)
+        return orig                                 # non-specific temporal word -> keep (not identifying)
 
     def transform_text_i2b2(self, tagdata):
         """creates a string in i2b2-XML format"""

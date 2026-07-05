@@ -104,6 +104,17 @@ class Main:
                         help="Path to a directoy to store/load the pos data for all notes. If no path is specified then memory caching will be used.",	
                         type=str)
 
+        ap.add_argument("--shifts", default=None,
+                        help="Path to a JSON mapping {note_filename: shift_days} — with "
+                             "--outputformat surrogate, DATE spans are replaced by the real date "
+                             "shifted by the patient's canonical offset (not asterisks).",
+                        type=str)
+        ap.add_argument("--default_shift", default=0,
+                        help="Date shift (days) applied when a note has no entry in --shifts. "
+                             "0 means unknown-shift dates are redacted, never leaked.",
+                        type=int)
+
+        ap.add_argument("--known_names", default=None, help="JSON {notefile:[name tokens]} to surrogate by identity", type=str)
         args = ap.parse_args()
         run_eval = args.run_eval
         verbose = args.verbose
@@ -143,6 +154,9 @@ class Main:
             philter_config["finpath"] = args.input
             philter_config["foutpath"] = args.output
             philter_config["outformat"] = args.outputformat
+            philter_config["date_shifts"] = args.shifts
+            philter_config["default_date_shift"] = args.default_shift
+            if args.known_names: philter_config["known_names"] = args.known_names
             philter_config["filters"] = args.filters
             philter_config["time_profile"] = args.time_profile
             philter_config["cachepos"] = args.cachepos

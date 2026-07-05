@@ -1,0 +1,37 @@
+# Stanford-specific site identifiers to remove (curated from scale-mining 99,897 STARR notes, 2026-07-04).
+# Institutions
+Stanford Hospital and Clinics
+Stanford Health Care
+Stanford Healthcare
+Stanford University Medical Center
+Stanford University
+Stanford Hospital
+Stanford Anatomic Pathology
+Lucile Packard Children's Hospital
+Lucile Packard
+Palo Alto Medical Foundation
+El Camino Hospital
+Sequoia Hospital
+Santa Clara Valley Medical Center
+Blake Wilbur
+SHC
+LPCH
+# Stanford domains / portals
+stanfordhealthcare.org
+myhealth.stanfordhealthcare.org
+prism.stanfordmedicine.org
+evercore.stanfordmed.org
+stanfordchildrens.org
+stanfordhospital.org
+stanfordmed.org
+stanfordmedicine.org
+stanford.edu
+# Stanford addresses (campus + affiliated)
+300 Pasteur Drive
+500 Pasteur Drive
+211 Quarry Road
+900 Blake Wilbur Drive
+725 Welch Road
+3375 Hillview Ave
+2452 Watson Court
+1300 Crane Street
