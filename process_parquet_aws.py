@@ -42,12 +42,16 @@ logger = logging.getLogger(__name__)
 _philter_instance = None
 _philter_config_path = None
 _pattern_data_cache = None
+_surrogate_mode = True          # replace PHI with deterministic fakes (vs asterisks)
+_default_shift = 0              # per-note date shift applied when no ShiftDays column is present
 
 
-def _init_worker(config_path):
+def _init_worker(config_path, surrogate_mode=True, default_shift=0):
     """Initialize Philter once per worker."""
-    global _philter_instance, _philter_config_path, _pattern_data_cache
+    global _philter_instance, _philter_config_path, _pattern_data_cache, _surrogate_mode, _default_shift
     _philter_config_path = config_path
+    _surrogate_mode = surrogate_mode
+    _default_shift = default_shift
 
     try:
         philter_config = {
@@ -55,7 +59,8 @@ def _init_worker(config_path):
             "phi_text": {},
             "filenames": [],
             "verbose": False,
-            "run_eval": False
+            "run_eval": False,
+            "default_date_shift": default_shift,
         }
         _philter_instance = Philter(philter_config)
 
@@ -107,6 +112,20 @@ def _fast_transform(text, filename, philter):
     return ''.join(result)
 
 
+def _deid_one(deid_key, text, shift_days, philter):
+    """De-identify one record. In surrogate mode, replaces PHI with deterministic fakes and shifts
+    in-text dates by the per-note `shift_days` (falls back to the worker default). Otherwise uses the
+    legacy fast asterisk transform. Same PHI coordinates either way — only the replacement differs."""
+    if _surrogate_mode:
+        sd = shift_days if shift_days is not None else _default_shift
+        try:
+            philter.date_shifts[deid_key] = int(sd)
+        except (ValueError, TypeError):
+            philter.date_shifts[deid_key] = _default_shift
+        return philter.transform_text_surrogate(text, deid_key)
+    return _fast_transform(text, deid_key, philter)
+
+
 def _process_batch(batch_data):
     """
     Process a batch of records.
@@ -128,9 +147,10 @@ def _process_batch(batch_data):
 
     texts_dict = {}
     record_map = {}
+    shift_map = {}
     status_records = []
 
-    for note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date, text, de_id_filename in batch_data:
+    for note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date, text, de_id_filename, shift_days in batch_data:
         if not text or len(str(text).strip()) == 0:
             status_records.append((note_csn_id, str(de_id_filename), "skipped"))
             continue
@@ -139,6 +159,7 @@ def _process_batch(batch_data):
         cleaned_text = keyword_removal.remove_keywords(str(text))
         texts_dict[deid_key] = cleaned_text
         record_map[deid_key] = (note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date)
+        shift_map[deid_key] = shift_days
 
     if not texts_dict:
         return [], status_records
@@ -180,9 +201,10 @@ def _process_batch(batch_data):
 
         for deid_key in texts_dict.keys():
             try:
-                deid_text = _fast_transform(
-                    texts_dict[deid_key],
+                deid_text = _deid_one(
                     deid_key,
+                    texts_dict[deid_key],
+                    shift_map.get(deid_key),
                     _philter_instance
                 )
                 note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
@@ -262,9 +284,10 @@ def _process_batch_bi(batch_data):
 
     texts_dict = {}
     record_map = {}
+    shift_map = {}
     status_records = []
 
-    for clinicalnotetextkey, type_val, shifted_creation, count_val, text, deidentified_name in batch_data:
+    for clinicalnotetextkey, type_val, shifted_creation, count_val, text, deidentified_name, shift_days in batch_data:
         if not text or len(str(text).strip()) == 0:
             status_records.append((clinicalnotetextkey, str(deidentified_name), "skipped"))
             continue
@@ -273,6 +296,7 @@ def _process_batch_bi(batch_data):
         cleaned_text = keyword_removal.remove_keywords(str(text))
         texts_dict[deid_key] = cleaned_text
         record_map[deid_key] = (clinicalnotetextkey, type_val, shifted_creation, count_val)
+        shift_map[deid_key] = shift_days
 
     if not texts_dict:
         return [], status_records
@@ -309,7 +333,7 @@ def _process_batch_bi(batch_data):
 
         for deid_key in texts_dict.keys():
             try:
-                deid_text = _fast_transform(texts_dict[deid_key], deid_key, _philter_instance)
+                deid_text = _deid_one(deid_key, texts_dict[deid_key], shift_map.get(deid_key), _philter_instance)
                 clinicalnotetextkey, type_val, shifted_creation, count_val = record_map[deid_key]
                 results.append((deid_key, deid_text, type_val, shifted_creation, count_val))
                 status_records.append((clinicalnotetextkey, deid_key, "deidentified"))
@@ -442,7 +466,7 @@ def write_status_csv(status_records, output_path, partition_id, id_col='NoteCSNI
         writer.writerows(status_records)
 
 
-def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None, id_col='NoteCSNID', text_col='NoteTXT', note_type='clinicalnotes', filename_col='de_id_filename'):
+def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None, id_col='NoteCSNID', text_col='NoteTXT', note_type='clinicalnotes', filename_col='de_id_filename', surrogate_mode=True, default_shift=0, shift_col=None):
     """
     Process a partition of Parquet files.
 
@@ -524,13 +548,25 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         logger.error(f"Missing columns: {missing}")
         logger.error(f"Available columns: {cols}")
         return
+    # Per-note date-shift column (canonical per-patient offset): read if present, else use default_shift.
+    have_shift_col = bool(shift_col) and shift_col in cols
+    if surrogate_mode:
+        if have_shift_col:
+            NEED_COLS = NEED_COLS + [shift_col]
+            logger.warning(f"  Surrogate mode ON; per-note date shift from column '{shift_col}'")
+        else:
+            logger.warning(f"  Surrogate mode ON; in-text dates shifted by default {default_shift} days "
+                           f"({'no shift column present' if shift_col else 'no --shift-col given'})")
+    else:
+        logger.warning("  Surrogate mode OFF (legacy asterisk redaction)")
     logger.warning(f"  Columns: {cols}")
     del first_table
 
     # Initialize worker pool
     logger.warning(f"\nInitializing {num_workers} workers...")
     init_start = datetime.now()
-    pool = Pool(processes=num_workers, initializer=_init_worker, initargs=(philter_config,),
+    pool = Pool(processes=num_workers, initializer=_init_worker,
+                initargs=(philter_config, surrogate_mode, default_shift),
                 maxtasksperchild=50)
     init_elapsed = (datetime.now() - init_start).total_seconds()
     logger.warning(f"✓ Workers ready in {init_elapsed:.1f}s")
@@ -582,6 +618,8 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
             chunk_gb = df_chunk.memory_usage(deep=True).sum() / 1024**3
             logger.warning(f"  Chunk {chunk_num}/{num_chunks}: {chunk_records:,} records ({chunk_gb:.1f} GB)")
 
+            # per-note shift column (or a column of None -> workers apply the default shift)
+            shift_vals = df_chunk[shift_col].values if have_shift_col else [None] * len(df_chunk)
             if note_type == 'bi_clinicalnotes':
                 file_data = list(zip(
                     df_chunk[id_col].values,
@@ -589,7 +627,8 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
                     df_chunk['SHIFTED_CREATIONINSTANT'].values,
                     df_chunk['COUNT'].values,
                     df_chunk[text_col].values,
-                    df_chunk[filename_col].values
+                    df_chunk[filename_col].values,
+                    shift_vals
                 ))
             else:
                 file_data = list(zip(
@@ -598,7 +637,8 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
                     df_chunk['bdsp_encounter_id'].values,
                     df_chunk['ShiftedContactDate'].values,
                     df_chunk[text_col].values,
-                    df_chunk[filename_col].values
+                    df_chunk[filename_col].values,
+                    shift_vals
                 ))
             del df_chunk
 
@@ -702,6 +742,14 @@ def main():
     parser.add_argument('--file-end', type=int, default=None, help='Index of last file (exclusive, for splitting subfolders)')
     parser.add_argument('--note-type', choices=['clinicalnotes', 'imagingreport', 'bi_clinicalnotes'], default='clinicalnotes',
                         help='Type of notes: clinicalnotes (NoteTXT/NoteCSNID), imagingreport (ReportTXT/OrderProcedureID), or bi_clinicalnotes (TEXT/CLINICALNOTETEXTKEY)')
+    parser.add_argument('--surrogate', dest='surrogate', action='store_true', default=True,
+                        help='Replace PHI with deterministic fakes + shifted dates (default)')
+    parser.add_argument('--no-surrogate', dest='surrogate', action='store_false',
+                        help='Legacy behavior: redact PHI with asterisks')
+    parser.add_argument('--default-shift', type=int, default=0,
+                        help='Days to shift in-text dates when no per-note shift column is present')
+    parser.add_argument('--shift-col', default=None,
+                        help='Parquet column holding the per-note (canonical per-patient) date-shift in days')
 
     args = parser.parse_args()
 
@@ -737,6 +785,9 @@ def main():
         text_col=text_col,
         note_type=args.note_type,
         filename_col=filename_col,
+        surrogate_mode=args.surrogate,
+        default_shift=args.default_shift,
+        shift_col=args.shift_col,
     )
 
 
