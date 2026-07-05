@@ -1555,9 +1555,11 @@ class Philter:
         return scheme + self._fake_domain(host) + "." + tld   # path dropped (may carry portal tokens)
 
     def _shift_date_str(self, orig, shift_days):
-        """Return `orig` (a detected date) shifted by shift_days, rendered in the same numeric
-        format where possible. Falls back to asterisks if the date can't be parsed OR no shift is
-        known (shift_days == 0), so a real date is never emitted unshifted."""
+        """Return `orig` (a detected date) shifted by shift_days, rendered in the same numeric format
+        where possible. A shift of 0 is a LEGITIMATE per-patient offset (the offset is secret and drawn
+        including 0): the output date is then the real date but is indistinguishable from any shifted
+        one, so we emit it normally -- we do NOT asterisk it, because asterisking would MARK the shift=0
+        patients and thereby leak a clue about all their other dates. Unparseable dates fall back below."""
         import datetime as _dt
         s = orig.strip()
         numeric_fmts = ["%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
@@ -1567,15 +1569,13 @@ class Philter:
                 d = _dt.datetime.strptime(s, fmt)
             except ValueError:
                 continue
-            if shift_days == 0:
-                return "*" * len(orig)              # no known shift -> do not leak the real date
             shifted = (d + _dt.timedelta(days=shift_days)).strftime(fmt)
             return orig.replace(s, shifted) if s in orig else shifted
         # word dates (e.g. "March 4, 2019") via dateparser
         try:
             import dateparser
             d = dateparser.parse(s)
-            if d and shift_days != 0:
+            if d:
                 shifted = d + _dt.timedelta(days=shift_days)
                 # month-year input ("March 2020", no day) -> keep month-year granularity, don't invent a day
                 if re.fullmatch(r"[A-Za-z]{3,9}\.?\s+\d{4}", s):
