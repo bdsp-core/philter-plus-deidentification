@@ -1,4 +1,21 @@
 import re
+import hmac, hashlib, os
+
+# Deterministic FAKE institution names (hiding in plain sight, like the other surrogates), so a scrubbed
+# site name reads as a plausible hospital instead of "*****". Same real name -> same fake (keyed HMAC).
+_SALT = os.environ.get("SURROGATE_SALT", "philter-surrogate-v1").encode()
+_SITE_PLACE = ("Fairview Riverside Lakeside Summit Cedar Hillcrest Brookfield Oakmont Parkview Westgate "
+               "Northshore Southridge Maplewood Sunrise Greenfield Pinecrest Bayside Ridgemont Clearwater "
+               "Stonebridge Meadowbrook Glenwood Harborview Kingston Auburn").split()
+_SITE_TYPE = ["Hospital", "Medical Center", "Health System", "Regional Medical Center",
+              "Community Hospital", "Health Care", "Clinic", "Memorial Hospital"]
+
+
+def _fake_site(matched):
+    h = hmac.new(_SALT, ("site:" + matched.lower().strip()).encode("utf-8", "ignore"), hashlib.sha256).digest()
+    place = _SITE_PLACE[int.from_bytes(h[:4], "big") % len(_SITE_PLACE)]
+    typ = _SITE_TYPE[int.from_bytes(h[4:8], "big") % len(_SITE_TYPE)]
+    return f"{place} {typ}"
 
 
 def remove_keywords(text):
@@ -264,7 +281,7 @@ def remove_keywords(text):
     for keyword in keywords:
         # Adjusted regex pattern to remove hospital names with flexibility for spaces and line breaks
         pattern = re.compile(keyword, flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(pattern, '*****', text)
+        text = pattern.sub(lambda m: _fake_site(m.group(0)), text)   # fake site name, not "*****"
 
     return text
 
