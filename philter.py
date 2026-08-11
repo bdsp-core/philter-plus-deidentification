@@ -33,7 +33,12 @@ _CTX_CLINICAL_AFTER = re.compile(
     r"(disease|syndrome|sign|stain|test|maneuver|manoeuvre|reflex|phenomenon|palsy|"
     r"encephalopathy|sarcoma|lymphoma|carcinoma|tumou?r|fracture|classification|criteria|score|"
     r"scale|index|method|position|nodule|bodies|body|cells|cell|fiber|fibre|angle|ligament|canal|"
-    r"gland|duct|space|triangle|notch|deformity|contracture|an[ae]mia|ulcer|node|nodes|plexus)\b", re.I)
+    r"gland|duct|space|triangle|notch|deformity|contracture|an[ae]mia|ulcer|node|nodes|plexus|"
+    # stains / special preparations: "Congo red", "Wright stain", "Masson trichrome", "Giemsa"
+    r"red|blue|silver|trichrome|giemsa|elastic|reticulin|immunostain|antibody|"
+    # molecular: "KRAS mutation", "BRAF amplification", "EGFR expression"
+    r"mutation|mutations|gene|genes|amplification|expression|fusion|deletion|duplication|"
+    r"variant|allele|locus|positivity|hybridization|hybridisation)\b", re.I)
 _CTX_MED_AFTER = re.compile(
     r"^[\s:\-]*(\d|mg\b|mcg\b|ug\b|gram|ml\b|unit|units|tab\b|tabs\b|tablet|cap\b|caps\b|"
     r"capsule|susp|solution|syrup|patch|cream|ointment|supp|po\b|iv\b|im\b|sc\b|sq\b|prn\b|"
