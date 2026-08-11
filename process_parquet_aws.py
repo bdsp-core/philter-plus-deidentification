@@ -20,6 +20,7 @@ import pandas as pd
 from philter import Philter
 import keyword_removal
 import argparse
+import sys
 import logging
 import csv
 from datetime import datetime
@@ -44,6 +45,15 @@ _philter_config_path = None
 _pattern_data_cache = None
 _surrogate_mode = True          # replace PHI with deterministic fakes (vs asterisks)
 _default_shift = 0              # per-note date shift applied when no ShiftDays column is present
+_fallback_count = 0             # surrogate->asterisk fallbacks; MUST stay 0 in surrogate mode
+
+
+def _preflight_surrogate(config_path):
+    """Verify the surrogate machinery actually works BEFORE processing millions of notes.
+    The asterisk fallback is silent by design, so without this a missing dependency costs a full run."""
+    import surrogate_names
+    surrogate_names._load()          # raises if the nltk 'names' corpus or surname list is unavailable
+    return True
 
 
 def _init_worker(config_path, surrogate_mode=True, default_shift=0):
@@ -212,7 +222,14 @@ def _process_batch(batch_data):
                                 shifted_contact_date, deid_text, deid_key))
                 status_records.append((note_csn_id, deid_key, "deidentified"))
             except Exception as e1:
-                # Fallback to original method
+                # LOUD fallback. Previously this swallowed e1 entirely and still recorded
+                # "deidentified", so a missing NLTK 'names' corpus silently turned an entire
+                # 62M-note run into asterisk redaction. Never degrade quietly.
+                global _fallback_count
+                _fallback_count += 1
+                if _fallback_count <= 5 or _fallback_count % 10000 == 0:
+                    logger.error(f"SURROGATE FAILED (fallback #{_fallback_count}) -> asterisk redaction: "
+                                 f"{type(e1).__name__}: {str(e1)[:200]}")
                 try:
                     deid_text = _philter_instance.transform_text_asterisk(
                         texts_dict[deid_key],
@@ -799,6 +816,20 @@ def main():
         id_col = 'NoteCSNID'
         text_col = 'NoteTXT'
         filename_col = 'de_id_filename'
+
+    # Preflight: prove the surrogate machinery works before touching any data. Without this the
+    # asterisk fallback silently produces a redacted corpus that still passes row-count and
+    # PHI-pattern checks.
+    if args.surrogate:
+        try:
+            _preflight_surrogate(args.philter_config)
+            logger.warning("  Surrogate preflight OK (name lists loaded)")
+        except Exception as e:
+            logger.error(f"SURROGATE PREFLIGHT FAILED: {type(e).__name__}: {e}")
+            logger.error("Refusing to run: output would silently be asterisk-redacted, not surrogate-replaced.")
+            logger.error("Most likely cause: the NLTK 'names' corpus is not installed "
+                         "(python -m nltk.downloader names).")
+            sys.exit(3)
 
     # Validate paths
     if args.input_path.startswith('s3://'):

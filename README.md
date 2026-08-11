@@ -4,6 +4,48 @@ De-identifies clinical notes and imaging reports stored as Parquet files in AWS 
 
 ---
 
+## ⚠️ What this pipeline GUARANTEES (read before running or modifying)
+
+Full detail: **[DEID_METHODOLOGY.md](DEID_METHODOLOGY.md)** — especially *"The whitelist-restore guard"*.
+This section exists because that document was missed once and a run silently lost every guarantee below.
+
+| guarantee | mechanism | how to VERIFY it happened |
+|---|---|---|
+| PHI replaced by realistic **fakes**, not asterisks | `transform_text_surrogate` (`--surrogate`, default on) | output must contain almost no `***`. Any run with >2% is the FALLBACK, not surrogates |
+| **Eponyms and clinical terms preserved** (`Parkinson`, `Prader-Willi`, biomarkers, genomic coords) | whitelist-restore guard **inside `transform_text_surrogate`** | those terms appear unchanged in output |
+| dates shifted by the patient's **canonical offset** | `--shift-col` / `default_date_shift` | in-text dates move by the same offset as structured data |
+| same real name → same fake name everywhere | HMAC-keyed surrogates on `de_id_filename` | one patient's name is consistent across their notes |
+
+### THE FAILURE MODE THAT COSTS YOU A WHOLE RUN
+
+`transform_text_surrogate` is wrapped in a `try/except` that falls back to `transform_text_asterisk`
+**and still records the note as "deidentified"**. So ANY error in the surrogate path — a missing corpus, an
+unreadable whitelist — silently converts the entire run to asterisk redaction with **no restore guard**,
+i.e. no eponym preservation, no clinical-term protection. It still produces plausible output, correct row
+counts, and PHI-pattern removal, so row-count and PHI checks all PASS.
+
+This happened: a missing NLTK `names` corpus turned a 62M-note run into asterisk redaction, undetected for
+five hours. Guards now in place — do not remove them:
+- `_preflight_surrogate()` runs before any data is touched and **exits 3** if surrogates cannot work.
+- surrogate→asterisk fallbacks are **counted and logged with the real exception** (`_fallback_count`).
+- the Loom QA gate has a `surrogate_not_asterisk` check.
+
+### RUNTIME DATA DEPENDENCIES (not in requirements.txt — they are NOT pip packages)
+
+`requirements.txt` lists `nltk`, but NLTK **corpora** are downloaded data. Missing `names` breaks
+surrogates specifically. Install all of these:
+
+```bash
+python -m nltk.downloader punkt punkt_tab averaged_perceptron_tagger \
+    averaged_perceptron_tagger_eng maxent_ne_chunker maxent_ne_chunker_tab words names
+pip install s3fs fsspec          # also missing from requirements.txt; needed for S3 I/O
+```
+
+NLTK 3.9 RENAMED resources: `averaged_perceptron_tagger_eng` and `punkt_tab` replace the older names.
+Installing only the old names fails at runtime with `map_coordinates failed` — and philter then writes
+**zero rows while still reporting a rec/sec figure**.
+
+
 ## Table of Contents
 
 - [Project Status](#project-status)
