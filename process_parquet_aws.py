@@ -208,7 +208,7 @@ def _process_batch(batch_data):
                     _philter_instance
                 )
                 note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
-                results.append((bdsp_patient_id, bdsp_encounter_id,
+                results.append((note_csn_id, bdsp_patient_id, bdsp_encounter_id,
                                 shifted_contact_date, deid_text, deid_key))
                 status_records.append((note_csn_id, deid_key, "deidentified"))
             except Exception as e1:
@@ -219,7 +219,7 @@ def _process_batch(batch_data):
                         deid_key
                     )
                     note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
-                    results.append((bdsp_patient_id, bdsp_encounter_id,
+                    results.append((note_csn_id, bdsp_patient_id, bdsp_encounter_id,
                                     shifted_contact_date, deid_text, deid_key))
                     status_records.append((note_csn_id, deid_key, "deidentified"))
                 except Exception as e2:
@@ -232,7 +232,7 @@ def _process_batch(batch_data):
             try:
                 deid_text = re.sub(r'[a-zA-Z0-9]', '*', texts_dict[deid_key])
                 note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
-                results.append((bdsp_patient_id, bdsp_encounter_id,
+                results.append((note_csn_id, bdsp_patient_id, bdsp_encounter_id,
                                 shifted_contact_date, deid_text, deid_key))
                 status_records.append((note_csn_id, deid_key, "full_redaction"))
             except Exception:
@@ -431,7 +431,12 @@ def write_parquet_batch(results, output_path, batch_num, text_col='NoteTXT', not
     if note_type == 'bi_clinicalnotes':
         df = pd.DataFrame(results, columns=['DeidentifiedName', 'TEXT', 'TYPE', 'CREATIONINSTANT', 'COUNT'])
     else:
-        df = pd.DataFrame(results, columns=['BDSPPatientID', 'bdsp_encounter_id', 'ShiftedContactDate', text_col, 'de_id_filename'])
+        # NoteCSNID emitted as a REAL column. It was previously dropped from results (kept only in the
+        # status CSV), leaving note identity recoverable solely by string-splitting de_id_filename
+        # ("{person_id}_{note_id}"). That makes the primary key a derived string and breaks on any null id.
+        # Must be right BEFORE the fleet runs — adding it later means re-scrubbing ~975M notes.
+        df = pd.DataFrame(results, columns=['NoteCSNID', 'BDSPPatientID', 'bdsp_encounter_id',
+                                            'ShiftedContactDate', text_col, 'de_id_filename'])
     table = pa.Table.from_pandas(df)
 
     output_file = f"{output_path.rstrip('/')}/batch_{batch_num:06d}.parquet"
@@ -533,7 +538,18 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         return
 
     # Define columns needed based on note type (must be before schema check)
-    if note_type == 'bi_clinicalnotes':
+    if note_type == 'loom':
+        # Loom note-text corpus: uniform schema across all sources, carrying the per-patient shift.
+        # ShiftedContactDate and de_id_filename are DERIVED here rather than materialised, so we do not
+        # rewrite ~1 TB of parquet just to rename columns.
+        # note_csn_id and de_id_filename are PRECOMPUTED by loom/note_corpus_keys.py and MUST be read,
+        # not derived. Deriving de_id_filename as person_id_note_id reintroduces the collisions the keying
+        # pass exists to remove (31.6M cross-source + ~149M duplicate-id rows), which would silently make
+        # different notes share a surrogate mapping.
+        NEED_COLS = ['person_id', 'note_id', 'note_datetime', 'note_text',
+                     'note_csn_id', 'de_id_filename']
+        batch_fn = _process_batch
+    elif note_type == 'bi_clinicalnotes':
         NEED_COLS = [id_col, 'TYPE', 'SHIFTED_CREATIONINSTANT', 'COUNT', text_col, filename_col]
         batch_fn = _process_batch_bi
     else:
@@ -620,7 +636,21 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
 
             # per-note shift column (or a column of None -> workers apply the default shift)
             shift_vals = df_chunk[shift_col].values if have_shift_col else [None] * len(df_chunk)
-            if note_type == 'bi_clinicalnotes':
+            if note_type == 'loom':
+                _shift = pd.to_numeric(df_chunk[shift_col], errors='coerce').fillna(0).astype(int) \
+                         if have_shift_col else pd.Series([0] * len(df_chunk))
+                _shifted_date = (pd.to_datetime(df_chunk['note_datetime'], errors='coerce')
+                                 + pd.to_timedelta(_shift, unit='D')).dt.date
+                file_data = list(zip(
+                    df_chunk['note_csn_id'].values,      # PRECOMPUTED unique note key
+                    df_chunk['person_id'].values,        # BDSPPatientID
+                    [None] * len(df_chunk),              # bdsp_encounter_id (not carried in corpus)
+                    _shifted_date.values,                # ShiftedContactDate = real + ShiftedDays
+                    df_chunk['note_text'].values,        # text
+                    df_chunk['de_id_filename'].values,   # PRECOMPUTED surrogate key — never derive here
+                    shift_vals
+                ))
+            elif note_type == 'bi_clinicalnotes':
                 file_data = list(zip(
                     df_chunk[id_col].values,
                     df_chunk['TYPE'].values,
@@ -740,7 +770,7 @@ def main():
     parser.add_argument('--philter-config', default='configs/philter_one.json', help='Path to Philter config')
     parser.add_argument('--file-start', type=int, default=0, help='Index of first file to process (0-based, for splitting subfolders)')
     parser.add_argument('--file-end', type=int, default=None, help='Index of last file (exclusive, for splitting subfolders)')
-    parser.add_argument('--note-type', choices=['clinicalnotes', 'imagingreport', 'bi_clinicalnotes'], default='clinicalnotes',
+    parser.add_argument('--note-type', choices=['clinicalnotes', 'imagingreport', 'bi_clinicalnotes', 'loom'], default='clinicalnotes',
                         help='Type of notes: clinicalnotes (NoteTXT/NoteCSNID), imagingreport (ReportTXT/OrderProcedureID), or bi_clinicalnotes (TEXT/CLINICALNOTETEXTKEY)')
     parser.add_argument('--surrogate', dest='surrogate', action='store_true', default=True,
                         help='Replace PHI with deterministic fakes + shifted dates (default)')
@@ -753,7 +783,11 @@ def main():
 
     args = parser.parse_args()
 
-    if args.note_type == 'imagingreport':
+    if args.note_type == 'loom':
+        id_col = 'note_id'
+        text_col = 'note_text'
+        filename_col = 'de_id_filename'      # DERIVED in process_partition, not read from the file
+    elif args.note_type == 'imagingreport':
         id_col = 'OrderProcedureID'
         text_col = 'ReportTXT'
         filename_col = 'de_id_filename'
