@@ -19,6 +19,34 @@ from textmethods import get_clean, get_tokens
 import pandas as pd
 from constants import *
 
+# ---------------------------------------------------------------------------------------------
+# CONTEXT RULE for tokens that are BOTH a clinical term and a surname (Senna, Graves, Bell,
+# Prader, Wilson). No word list can settle these: "Senna 8.6 mg" is a laxative, "Mr. Senna" is a
+# person, and the string is identical. Whitelisting leaks the name everywhere; excluding it
+# corrupts every medication list. So decide from the NEIGHBOURING TEXT instead — put the token
+# back only when its context is clinical, and never when its context is personal.
+# This implements the behaviour DEID_METHODOLOGY.md describes ("<Capitalized> disease/syndrome/
+# sign/stain is kept while Mr. Wilson is still removed"), which was documented but never written:
+# only a single hardcoded down_syndrome_safe.txt pattern existed.
+_CTX_CLINICAL_AFTER = re.compile(
+    r"^[\s\-]*(?:[A-ZÀ-Þ][A-Za-zà-ÿ']*[\s\-]+){0,2}"
+    r"(disease|syndrome|sign|stain|test|maneuver|manoeuvre|reflex|phenomenon|palsy|"
+    r"encephalopathy|sarcoma|lymphoma|carcinoma|tumou?r|fracture|classification|criteria|score|"
+    r"scale|index|method|position|nodule|bodies|body|cells|cell|fiber|fibre|angle|ligament|canal|"
+    r"gland|duct|space|triangle|notch|deformity|contracture|an[ae]mia|ulcer|node|nodes|plexus)\b", re.I)
+_CTX_MED_AFTER = re.compile(
+    r"^[\s:\-]*(\d|mg\b|mcg\b|ug\b|gram|ml\b|unit|units|tab\b|tabs\b|tablet|cap\b|caps\b|"
+    r"capsule|susp|solution|syrup|patch|cream|ointment|supp|po\b|iv\b|im\b|sc\b|sq\b|prn\b|"
+    r"bid\b|tid\b|qid\b|qhs\b|qd\b|daily|nightly|weekly|hs\b|ac\b|pc\b)", re.I)
+# Personal context WINS over clinical context: a credential or honorific means it is a person.
+_CTX_PERSON_BEFORE = re.compile(
+    r"\b(mr|mrs|ms|miss|dr|doctor|prof|attending|resident|rn|md|do|np|pa|by|per)\W{0,3}$", re.I)
+_CTX_PERSON_AFTER = re.compile(r"^\s*,?\s*(m\.?d|d\.?o|r\.?n|np|pa|phd|jr|sr|iii|ii|iv)\b", re.I)
+# camelCase medical tokens (AlkPhos, HgbA1c) are never personal names; guarded by the name check.
+_CTX_CAMEL_MED = re.compile(r"^[A-Z][a-z]+[A-Z][A-Za-z0-9]*$")
+# ---------------------------------------------------------------------------------------------
+
+
 class Philter:
     """ 
         General text filtering class,
@@ -1305,7 +1333,19 @@ class Philter:
                 if start in place_char:                          # a dictionary word INSIDE a place span
                     return                                       # ("Alto" of "Palo Alto") -> let it be faked
                 if w in self._safe_lower and (tok[0].islower() or w not in self._names):
-                    safe_char.update(range(start, end))
+                    safe_char.update(range(start, end)); return
+                # CONTEXT RULE — the token is Capitalized AND doubles as a surname, so the lists above
+                # deliberately refused it. Put it back only if the surrounding text is clinical.
+                if tok[0].isupper():
+                    _before = txt[max(0, start - 24):start]
+                    _after = txt[end:end + 28]
+                    if _CTX_PERSON_BEFORE.search(_before) or _CTX_PERSON_AFTER.match(_after):
+                        return                                   # "Dr. Senna", "Senna, MD" -> person
+                    if w in self._safe_lower and (_CTX_CLINICAL_AFTER.match(_after)
+                                                  or _CTX_MED_AFTER.match(_after)):
+                        safe_char.update(range(start, end)); return   # "Senna 8.6 mg", "Bell palsy"
+                    if _CTX_CAMEL_MED.match(tok) and w not in self._names:
+                        safe_char.update(range(start, end)); return   # "AlkPhos", "HgbA1c"
             # pass A: the whole hyphen/apostrophe compound as blessed (Ki-67, Ber-EP4, tilt-table).
             for m in re.finditer(r"[A-Za-z][A-Za-z0-9'\-]*", txt):
                 _restore(m.group(0), m.start(), m.end())

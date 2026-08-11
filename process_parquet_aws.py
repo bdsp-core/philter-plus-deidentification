@@ -46,6 +46,7 @@ _pattern_data_cache = None
 _surrogate_mode = True          # replace PHI with deterministic fakes (vs asterisks)
 _default_shift = 0              # per-note date shift applied when no ShiftDays column is present
 _fallback_count = 0             # surrogate->asterisk fallbacks; MUST stay 0 in surrogate mode
+_batch_timeout = 60             # seconds per sub-batch before FULL REDACTION (see --batch-timeout)
 
 
 def _preflight_surrogate(config_path):
@@ -56,9 +57,10 @@ def _preflight_surrogate(config_path):
     return True
 
 
-def _init_worker(config_path, surrogate_mode=True, default_shift=0):
+def _init_worker(config_path, surrogate_mode=True, default_shift=0, batch_timeout=60):
     """Initialize Philter once per worker."""
-    global _philter_instance, _philter_config_path, _pattern_data_cache, _surrogate_mode, _default_shift
+    global _philter_instance, _philter_config_path, _pattern_data_cache, _surrogate_mode, _default_shift, _batch_timeout
+    _batch_timeout = batch_timeout
     _philter_config_path = config_path
     _surrogate_mode = surrogate_mode
     _default_shift = default_shift
@@ -201,7 +203,7 @@ def _process_batch(batch_data):
 
     try:
         signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.alarm(60)  # 60 second timeout per batch (normal batch takes ~2s)
+        signal.alarm(_batch_timeout)  # per-batch cap; normal batch ~2s. See --batch-timeout.
 
         _philter_instance.texts = texts_dict
         _philter_instance.filenames = list(texts_dict.keys())
@@ -251,6 +253,9 @@ def _process_batch(batch_data):
                 note_csn_id, bdsp_patient_id, bdsp_encounter_id, shifted_contact_date = record_map[deid_key]
                 results.append((note_csn_id, bdsp_patient_id, bdsp_encounter_id,
                                 shifted_contact_date, deid_text, deid_key))
+                # Tagged full_redaction: every alphanumeric became '*', so the note is DESTROYED.
+                # The parent collects these from status_records and writes a retry queue to S3 —
+                # a worker-local list would never reach the parent under multiprocessing.
                 status_records.append((note_csn_id, deid_key, "full_redaction"))
             except Exception:
                 pass
@@ -472,6 +477,30 @@ def write_parquet_batch(results, output_path, batch_num, text_col='NoteTXT', not
     logger.warning(f"  Wrote batch {batch_num}: {len(results)} records to {output_file}")
 
 
+def write_retry_queue(status_records, output_path, partition_id):
+    """Persist the keys destroyed by the timeout path so a second pass can redo them properly.
+
+    The timeout fallback replaces EVERY alphanumeric character with '*', so those notes carry no
+    clinical content at all. Previously they were only recorded in a local status CSV that never left
+    the instance, so ~1% of notes were silently shipped as garbage.
+    """
+    keys = [r[1] for r in status_records if len(r) > 2 and r[2] == "full_redaction"]
+    if not keys:
+        return 0
+    body = "\n".join(keys) + "\n"
+    dest = f"{output_path.rstrip('/')}/_retry/timeouts_partition_{partition_id}.txt"
+    if dest.startswith("s3://"):
+        import s3fs
+        with s3fs.S3FileSystem().open(dest, "w") as f:
+            f.write(body)
+    else:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        open(dest, "w").write(body)
+    logger.warning(f"  RETRY QUEUE: {len(keys):,} notes hit the timeout and were FULLY REDACTED -> {dest}")
+    logger.warning(f"  Re-run these with a larger --batch-timeout before treating the output as complete.")
+    return len(keys)
+
+
 def write_status_csv(status_records, output_path, partition_id, id_col='NoteCSNID', filename_col='de_id_filename'):
     """Append status records to the partition-level status CSV."""
     if output_path.startswith('s3://'):
@@ -488,7 +517,7 @@ def write_status_csv(status_records, output_path, partition_id, id_col='NoteCSNI
         writer.writerows(status_records)
 
 
-def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None, id_col='NoteCSNID', text_col='NoteTXT', note_type='clinicalnotes', filename_col='de_id_filename', surrogate_mode=True, default_shift=0, shift_col=None):
+def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None, id_col='NoteCSNID', text_col='NoteTXT', note_type='clinicalnotes', filename_col='de_id_filename', surrogate_mode=True, default_shift=0, shift_col=None, batch_timeout=60, only_keys=None):
     """
     Process a partition of Parquet files.
 
@@ -554,6 +583,17 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         logger.warning("All files already processed! Nothing to do.")
         return
 
+    # --only-keys: retry mode. Process ONLY the notes listed (the timeout queue from a prior run).
+    only_set = None
+    if only_keys:
+        if only_keys.startswith("s3://"):
+            import s3fs
+            with s3fs.S3FileSystem().open(only_keys, "r") as f:
+                only_set = {ln.strip() for ln in f if ln.strip()}
+        else:
+            only_set = {ln.strip() for ln in open(only_keys) if ln.strip()}
+        logger.warning(f"  RETRY MODE: restricted to {len(only_set):,} keys from {only_keys}")
+
     # Define columns needed based on note type (must be before schema check)
     if note_type == 'loom':
         # Loom note-text corpus: uniform schema across all sources, carrying the per-patient shift.
@@ -599,7 +639,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     logger.warning(f"\nInitializing {num_workers} workers...")
     init_start = datetime.now()
     pool = Pool(processes=num_workers, initializer=_init_worker,
-                initargs=(philter_config, surrogate_mode, default_shift),
+                initargs=(philter_config, surrogate_mode, default_shift, batch_timeout),
                 maxtasksperchild=50)
     init_elapsed = (datetime.now() - init_start).total_seconds()
     logger.warning(f"✓ Workers ready in {init_elapsed:.1f}s")
@@ -647,6 +687,11 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         for record_batch in pf.iter_batches(batch_size=CHUNK_ROWS, columns=NEED_COLS):
             chunk_num += 1
             df_chunk = record_batch.to_pandas()
+            if only_set is not None:
+                _key = 'de_id_filename' if 'de_id_filename' in df_chunk.columns else filename_col
+                df_chunk = df_chunk[df_chunk[_key].astype(str).isin(only_set)]
+                if df_chunk.empty:
+                    continue
             chunk_records = len(df_chunk)
             chunk_gb = df_chunk.memory_usage(deep=True).sum() / 1024**3
             logger.warning(f"  Chunk {chunk_num}/{num_chunks}: {chunk_records:,} records ({chunk_gb:.1f} GB)")
@@ -740,6 +785,9 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         # Flush remaining status records for this file
         if all_status_records:
             write_status_csv(all_status_records, output_path, partition_id, id_col=id_col, filename_col=filename_col)
+            # Persist the notes destroyed by the timeout path (every alphanumeric -> '*') so a second
+            # pass with a larger --batch-timeout can redo them, instead of shipping garbage silently.
+            write_retry_queue(all_status_records, output_path, partition_id)
             all_status_records = []
 
         # Mark this file as completed in checkpoint
@@ -795,6 +843,12 @@ def main():
                         help='Legacy behavior: redact PHI with asterisks')
     parser.add_argument('--default-shift', type=int, default=0,
                         help='Days to shift in-text dates when no per-note shift column is present')
+    parser.add_argument('--batch-timeout', type=int, default=60,
+                        help='Seconds per sub-batch before FULL REDACTION (destroys the note). '
+                             'Raise it for slow/long notes; timed-out keys are written to _retry/ for a second pass.')
+    parser.add_argument('--only-keys', default=None,
+                        help='Path (local or s3://) to a newline-separated list of de_id_filename values. '
+                             'Process ONLY those notes — used to retry the _retry/ timeout queue.')
     parser.add_argument('--shift-col', default=None,
                         help='Parquet column holding the per-note (canonical per-patient) date-shift in days')
 
@@ -849,6 +903,8 @@ def main():
         id_col=id_col,
         text_col=text_col,
         note_type=args.note_type,
+        batch_timeout=args.batch_timeout,
+        only_keys=args.only_keys,
         filename_col=filename_col,
         surrogate_mode=args.surrogate,
         default_shift=args.default_shift,
