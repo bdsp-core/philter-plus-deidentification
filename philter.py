@@ -1511,6 +1511,32 @@ class Philter:
         # time: no lab value, vital sign, dose or score is a bare 7+ digit integer, so such a run is an
         # identifier unless it is one of the few genuinely numeric clinical notations, exempted here and
         # covered by bench cases.
+        # PROVIDER NAMES -> replaced deterministically, like the patient's own name. Tagging them via a
+        # filter was not enough: the tag kept losing to other rules. Traced on the 10k batch, the 723
+        # surviving occurrences were kept by SIX different mechanisms -- "Whitelist 1" marking them safe
+        # (87), safe phrase filters whose coordinate ranges merge with adjacent text and swallow the name
+        # ("ordering md safe", "young safe", "MyChart"), and spans correctly tagged PHI that later rules
+        # restored. Chasing them one at a time was not converging, so a roster name is now handled at the
+        # top of the loop where nothing downstream can put it back.
+        # ONLY capitalised occurrences: a roster surname that is also an ordinary word must stay readable
+        # in prose ("young adult" vs "Dr. Young"), which is the same rule philter applies to names.
+        provider_spans = {}
+        _prov = getattr(self, "_provider", ())
+        if _prov:
+            _prov_med = (getattr(self, "_safe_any", set()) | getattr(self, "_safe_ambig", set())
+                         | getattr(self, "_safe_ambig_strict", set()))
+            for m in re.finditer(r"\b[A-Z][A-Za-z'\-]{2,}\b", txt):
+                _w = m.group(0).lower().strip("'-")
+                if _w not in _prov:
+                    continue
+                # A roster surname that is ALSO curated clinical vocabulary keeps its clinical sense:
+                # "Thomas splint" is a splint even when a Dr. Thomas exists. Caught by the bench, which
+                # is the same failure as a patient named Foley losing "Foley catheter".
+                if _w in _prov_med:
+                    _aft = txt[m.end():m.end() + 28]
+                    if _CTX_CLINICAL_AFTER.match(_aft) or _CTX_MED_WINDOW.search(_aft):
+                        continue
+                provider_spans[m.start()] = m.end()
         longnum_spans = {}
         _exempt = set()
         for _rx in getattr(self, "_safe_rx", []):          # genomic coordinates / ISCN / ratios
@@ -1582,6 +1608,10 @@ class Philter:
                 stop = accession_spans[i]
                 contents.append(self._fake_accession(txt[i:stop]))
                 i = last_marker = stop; continue
+            if i in provider_spans and surrogate_names is not None:  # PROVIDER on the roster -> fake name
+                stop = provider_spans[i]
+                contents.append(surrogate_names.fake_name_span(txt[i:stop], txt[max(0, i-6):i]))
+                i = last_marker = stop; continue
             if i in longnum_spans:                                  # 7+ digit run -> fake digits (deny)
                 stop = longnum_spans[i]
                 contents.append(self._fake_digits(txt[i:stop]))
@@ -1619,8 +1649,8 @@ class Philter:
                 # ...nor a long digit run: an include range STARTING before an identifier and ending after
                 # it skips the loop past the default-deny check entirely (last_marker jumps over it),
                 # which is how the final 6 leaks on the 2,000-note sample survived.
-                nxt = min((k for k in list(known_spans) + list(longnum_spans) if i < k < stop),
-                          default=stop)
+                nxt = min((k for k in list(known_spans) + list(longnum_spans) + list(provider_spans)
+                           if i < k < stop), default=stop)
                 contents.append(txt[i:nxt]); i = last_marker = nxt; continue
             if i in date_spans:                                     # DATE -> shifted date
                 stop = date_spans[i]
