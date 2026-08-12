@@ -1321,6 +1321,9 @@ class Philter:
             # clinical noun to trigger on ("Senna, Colace, Dulcolax"). So the default is inverted for
             # this set only: put the term BACK unless the surrounding text says it is a person.
             self._safe_ambig = _load("filters/whitelists/whitelist_medical_ambiguous.json")
+            # Real provider surnames. Loaded here so the keep-rules below can refuse to restore
+            # one: a signature block is all-caps and would otherwise be kept as an "acronym".
+            self._provider = _load("filters/blacklists/provider_roster.json")
             # Second tier: clinical eponyms that are ALSO common GIVEN names (Peter, Thomas). Restoring
             # these by default leaks a real name from any sentence without an honorific to veto on
             # ("Peter reports chest pain"), so they need POSITIVE clinical context to come back.
@@ -1465,8 +1468,11 @@ class Philter:
                 safe_char.update(range(m.start(), m.end()))
             # all-caps clinical acronyms (QSART, SBP, DBP, HRDB, UCNS...) -> keep, UNLESS the token is a
             # known name (those are surrogated first via known_spans, so this can't keep a known name)
+            # ...or a PROVIDER on the roster. A signature block ("KRYSTAL DIMAYA, RN") is all-caps, so
+            # this rule was re-keeping provider names the roster filter had correctly tagged: 1,055 of
+            # the 2,109 surviving provider-name occurrences on the 10k batch were all-caps.
             for m in re.finditer(r"\b[A-Z][A-Z0-9]{1,}\b", txt):
-                if m.start() not in known_spans:
+                if m.start() not in known_spans and m.group(0).lower() not in getattr(self, "_provider", ()):
                     safe_char.update(range(m.start(), m.end()))
             # stat / measurement / directional abbreviations written WITH a trailing period ("Max.",
             # "Min.", "Post.") are labels, not names -- keep them (the period disambiguates from the
