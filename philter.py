@@ -38,7 +38,11 @@ _CTX_CLINICAL_AFTER = re.compile(
     r"red|blue|silver|trichrome|giemsa|elastic|reticulin|immunostain|antibody|"
     # molecular: "KRAS mutation", "BRAF amplification", "EGFR expression"
     r"mutation|mutations|gene|genes|amplification|expression|fusion|deletion|duplication|"
-    r"variant|allele|locus|positivity|hybridization|hybridisation)\b", re.I)
+    r"variant|allele|locus|positivity|hybridization|hybridisation|"
+    # surgical / procedural: "Pfannenstiel incision", "Kocher maneuver", "Foley catheter"
+    r"incision|approach|flap|graft|procedure|technique|suture|catheter|tube|valve|prosthesis|"
+    r"stent|clamp|forceps|retractor|speculum|blade|splint|cast|brace|shunt|drain|port|"
+    r"projection|view|plane|line|block|repair|resection|anastomosis)\b", re.I)
 _CTX_MED_AFTER = re.compile(
     r"^[\s:\-]*(\d|mg\b|mcg\b|ug\b|gram|ml\b|unit|units|tab\b|tabs\b|tablet|cap\b|caps\b|"
     r"capsule|susp|solution|syrup|patch|cream|ointment|supp|po\b|iv\b|im\b|sc\b|sq\b|prn\b|"
@@ -52,6 +56,9 @@ _CTX_PERSON_AFTER = re.compile(r"^\s*,?\s*(m\.?d|d\.?o|r\.?n|np|pa|phd|jr|sr|iii
 _CTX_MED_WINDOW = re.compile(
     r"^[^.\n]{0,40}?\b\d+(\.\d+)?\s*(mg|mcg|ug|g|ml|unit|units|tab|tabs|tablet|cap|caps|capsule)\b", re.I)
 # camelCase medical tokens (AlkPhos, HgbA1c) are never personal names; guarded by the name check.
+# A bare integer of 7+ digits is never a lab value, vital, dose or score -- it is an identifier.
+# Used to stop the CD (cardinal-number) SAFE filter from blessing identifiers earlier filters missed.
+_POS_LONG_DIGITS = re.compile(r"\d{7,}")
 _CTX_CAMEL_MED = re.compile(r"^[A-Z][a-z]+[A-Z][A-Za-z0-9]*$")
 # ---------------------------------------------------------------------------------------------
 
@@ -999,7 +1006,17 @@ class Philter:
                 start_coordinate += len(word)
                 continue
 
-            if pos in pos_set:    
+            if pos in pos_set:
+                # The CD ("cardinal number") rule is a SAFE filter whose stated job is to keep any
+                # number "not included in earlier steps" -- labs, vitals, doses. But it is the LAST
+                # word on a number, so any identifier that every earlier PHI filter happened to miss
+                # gets affirmatively marked safe by it. MEASURED: 81 identifiers (MRN, account and
+                # insurance numbers) survived a 2,000-note sample this way, 3.87% of all long digit
+                # runs. No lab value, vital, dose or score is a bare 7+ digit integer, so a run that
+                # long is never the kind of number this rule exists to protect.
+                if pos == "CD" and _POS_LONG_DIGITS.fullmatch(word_clean):
+                    start_coordinate += len(word)
+                    continue
                 coord_map.add_extend(filename, start, stop)
                 
             #advance our start coordinate
@@ -1241,7 +1258,7 @@ class Philter:
         _toks = self.known_names.get(os.path.basename(infilename), [])
         for _t in _toks:
             if len(_t) >= 2:
-                for m in re.finditer(r"(?<![A-Za-z])" + re.escape(_t) + r"(?![A-Za-z])", txt, re.I):
+                for m in re.finditer(r"(?<![A-Za-z])" + re.escape(_t) + r"s?(?![A-Za-z])", txt, re.I):
                     if not m.group(0)[:1].isupper():      # a real name is Capitalized; a lowercase match is
                         continue                          # a common-word collision ("Will" the name vs "will")
                     known_spans[m.start()] = m.end()
@@ -1304,6 +1321,10 @@ class Philter:
             # clinical noun to trigger on ("Senna, Colace, Dulcolax"). So the default is inverted for
             # this set only: put the term BACK unless the surrounding text says it is a person.
             self._safe_ambig = _load("filters/whitelists/whitelist_medical_ambiguous.json")
+            # Second tier: clinical eponyms that are ALSO common GIVEN names (Peter, Thomas). Restoring
+            # these by default leaks a real name from any sentence without an honorific to veto on
+            # ("Peter reports chest pain"), so they need POSITIVE clinical context to come back.
+            self._safe_ambig_strict = _load("filters/whitelists/whitelist_medical_ambiguous_strict.json")
             # English stopwords / function words are NEVER PHI, but the medical dictionary omits many
             # short ones ("of", "to", "in"); without this, a function word Philter mis-tags (e.g. the
             # "of" in an "X of Y" org pattern) falls through to the fake-name fallback ("of" -> "edele").
@@ -1347,10 +1368,17 @@ class Philter:
                     return
                 if w in self._safe_any:                          # curated medical term -> keep even in a place
                     safe_char.update(range(start, end)); return
+                # PERSON VETO — evaluated BEFORE any put-back, in EITHER case. Notes are full of
+                # lowercase names ("seen by smith", "d/w mr. johnson"), and the put-back list is mostly
+                # eponyms that are also very common surnames (Stevens-Johnson, Smith-Lemli-Opitz), so a
+                # lowercase put-back with no veto restored the real surname verbatim. MEASURED: 409
+                # restorations with personal context present in a 2,000-note sample.
+                _before = txt[max(0, start - 24):start]
+                _after = txt[end:end + 28]
+                _is_person = bool(_CTX_PERSON_BEFORE.search(_before) or _CTX_PERSON_AFTER.match(_after))
                 # PUT-BACK (any case): clinical vocabulary that doubles as a surname. Applied before the
                 # capitalisation logic because these terms appear lowercase too ("myasthenia gravis").
-                # Personal context is vetoed further down for the capitalised case.
-                if w in getattr(self, "_safe_ambig", ()) and tok[0].islower():
+                if w in getattr(self, "_safe_ambig", ()) and tok[0].islower() and not _is_person:
                     safe_char.update(range(start, end)); return
                 if start in place_char:                          # a dictionary word INSIDE a place span
                     return                                       # ("Alto" of "Palo Alto") -> let it be faked
@@ -1359,9 +1387,7 @@ class Philter:
                 # CONTEXT RULE — the token is Capitalized AND doubles as a surname, so the lists above
                 # deliberately refused it. Put it back only if the surrounding text is clinical.
                 if tok[0].isupper():
-                    _before = txt[max(0, start - 24):start]
-                    _after = txt[end:end + 28]
-                    if _CTX_PERSON_BEFORE.search(_before) or _CTX_PERSON_AFTER.match(_after):
+                    if _is_person:
                         return                                   # "Dr. Senna", "Senna, MD" -> person
                     if w in self._safe_lower and (_CTX_CLINICAL_AFTER.match(_after)
                                                   or _CTX_MED_AFTER.match(_after)
@@ -1371,6 +1397,12 @@ class Philter:
                     # context marks a person. The patient's real name is separately injected from the
                     # structured record, so this does not expose the patient's own surname.
                     if w in getattr(self, "_safe_ambig", ()):
+                        safe_char.update(range(start, end)); return
+                    # Name-dominant tier: only with positive clinical evidence after the token
+                    # ("Thomas splint", "Stevens-Johnson syndrome"). Never restored on its own.
+                    if w in getattr(self, "_safe_ambig_strict", ()) and (
+                            _CTX_CLINICAL_AFTER.match(_after) or _CTX_MED_AFTER.match(_after)
+                            or _CTX_MED_WINDOW.search(_after)):
                         safe_char.update(range(start, end)); return
                     if _CTX_CAMEL_MED.match(tok) and w not in self._names:
                         safe_char.update(range(start, end)); return   # "AlkPhos", "HgbA1c"
@@ -1385,6 +1417,16 @@ class Philter:
             for _rx in getattr(self, "_safe_rx", []):
                 for m in _rx.finditer(txt):
                     safe_char.update(range(m.start(), m.end()))
+            # SIG / FREQUENCY ABBREVIATIONS -> keep. Same failure mode as doses: philter tags the
+            # trailing letters and surrogate mode swaps them for a fake NAME. MEASURED: "q8hr" was
+            # destroyed in 158/158 notes ("Tylenol 975 q8hr" -> "q8woldeyohannes"), while "q8h"
+            # survived - the difference is which fragment got tagged, so cover every form.
+            for m in re.finditer(
+                    r"(?i)\b(?:q\s*\d+\s*(?:h|hr|hrs|hour|hours|d|day|days|min|mins|wk|week|weeks)"
+                    r"|q\.?[dhw]|qod|qhs|qam|qpm|qac|qpc|bid|tid|qid|prn|ac|pc|po|pr|iv|im|sc|sq|sl|ng|"
+                    r"npo|gtt|gtts|ud|stat|x\s*\d+\s*(?:d|days|wk|weeks|mo|months))\b", txt):
+                safe_char.update(range(m.start(), m.end()))
+
             # DOSES AND MEASUREMENTS -> keep the NUMBER AND ITS UNIT.
             # Surrogate mode replaces an un-typed number with a plausible DIFFERENT number, which is
             # right for an MRN and dangerous for a dose: measured on a 2,000-note sample, 13.8% of notes
@@ -1392,10 +1434,19 @@ class Philter:
             # a silent five-fold error written into the de-identified record with nothing to flag it.
             # The pre-existing decimal rule below covers "2.5 mg" but NOT the integer form "2 mg",
             # which is why plain doses were corrupted while decimal ones survived.
+            # THREE BOUNDS, each of which this pattern was missing, and together they made it keep
+            # identifiers: unbounded `\s*` let the number reach a unit many characters away; the
+            # single-letter units (g, L, d) matched the FIRST LETTER of an ordinary word; and the digit
+            # count was unlimited. So "Acct: 12345678  Loc:" matched as "12345678  L" -- 8-digit account
+            # number kept as a volume in litres, and the stolen "L" left "oc" to be surrogated into a
+            # fake name. MEASURED: this single pattern accounted for the bulk of the 81 identifiers
+            # surviving a 2,000-note sample. A dose is at most a few digits, sits next to its unit, and
+            # the unit ends at a non-letter.
             for m in re.finditer(
-                    r"(?<![\w.])\d+(?:\.\d+)?(?:\s*[-–/]\s*\d+(?:\.\d+)?)*\s*"
-                    r"(?:mcg|mg|µg|ug|kg|gm|g|mL|ml|L|cc|units?|iu|mmol|mmols|meq|mEq|ng|pg|mmHg|%)"
-                    r"(?:\s*/\s*(?:hr|hrs|h|hour|kg|day|d|min|wk|week|m2|dose|24h))?", txt, re.I):
+                    r"(?<![\w.])\d{1,6}(?:\.\d+)?(?:\s{0,3}[-–/]\s{0,3}\d{1,6}(?:\.\d+)?)*\s{0,3}"
+                    r"(?:mcg|mg|µg|ug|kg|gm|g|mL|ml|L|cc|units?|iu|mmols|mmol|meq|mEq|ng|pg|mmHg|%)"
+                    r"s?(?![A-Za-z])"
+                    r"(?:\s{0,3}/\s{0,3}(?:hr|hrs|h|hour|kg|day|d|min|wk|week|m2|dose|24h)\b)?", txt, re.I):
                 safe_char.update(range(m.start(), m.end()))
             # clinical measurements -> keep: dimensions ("1.5 x 2.0", "15x10x8"), standalone decimals
             # ("2.5", dose/size), and 0-10 pain/severity scores ("7/10").
@@ -1407,7 +1458,7 @@ class Philter:
             # fallback that would otherwise turn a stray-tagged unit into a fake word).
             for m in re.finditer(r"(?<![A-Za-z])(?:mm|cm|km|kg|mg|mcg|ug|ng|ml|dl|cc|oz|lb|iu|meq|mmol|"
                                  r"mmHg|mmhg|bpm|rpm|Hz|kV|mV|nm|um|Gy|cGy|mCi|kcal|cm2|mm2|mm3|cm3)"
-                                 r"(?![A-Za-z])", txt):
+                                 r"s?(?![A-Za-z])", txt):
                 safe_char.update(range(m.start(), m.end()))
             # bare 1-3 digit numbers are vitals/labs/counts, never identifying -> keep (protects tables)
             for m in re.finditer(r"(?<![\w./])\d{1,3}(?![\w./])", txt):
