@@ -531,7 +531,7 @@ def write_status_csv(status_records, output_path, partition_id, id_col='NoteCSNI
         writer.writerows(status_records)
 
 
-def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None, id_col='NoteCSNID', text_col='NoteTXT', note_type='clinicalnotes', filename_col='de_id_filename', surrogate_mode=True, default_shift=0, shift_col=None, batch_timeout=60, only_keys=None):
+def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None, id_col='NoteCSNID', text_col='NoteTXT', note_type='clinicalnotes', filename_col='de_id_filename', surrogate_mode=True, default_shift=0, shift_col=None, batch_timeout=60, only_keys=None, names_path=None):
     """
     Process a partition of Parquet files.
 
@@ -641,12 +641,28 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         return
     # Per-note date-shift column (canonical per-patient offset): read if present, else use default_shift.
     have_name_cols = note_type == 'loom' and all(c in cols for c in NAME_COLS)
+    # SIDE-CAR NAME LOOKUP. The keyed corpus is ~944M rows / ~2.26 TB of note text; rewriting all of it
+    # just to carry three name columns costs hours of compute to add a few hundred MB of data. Load the
+    # names once here instead (12.4M patients, ~150 MB parquet) and attach them per row, so an existing
+    # corpus gains known-name injection with no rebuild.
+    names_lookup = None
+    if note_type == 'loom' and not have_name_cols and names_path:
+        import pyarrow.dataset as _ds
+        _t = _ds.dataset(names_path, format='parquet').to_table(
+            columns=['person_id', 'first_name', 'middle_name', 'last_name'])
+        names_lookup = {str(k): (a, b, c) for k, a, b, c in
+                        zip(_t.column('person_id').to_pylist(), _t.column('first_name').to_pylist(),
+                            _t.column('middle_name').to_pylist(), _t.column('last_name').to_pylist())}
+        del _t
+        logger.warning(f"  Known-name lookup loaded: {len(names_lookup):,} patients")
     if note_type == 'loom':
         if have_name_cols:
             NEED_COLS = NEED_COLS + NAME_COLS
-            logger.warning("  Known-name injection ON (patient name surrogated by identity)")
+            logger.warning("  Known-name injection ON (name columns on the corpus)")
+        elif names_lookup:
+            logger.warning("  Known-name injection ON (side-car lookup)")
         else:
-            logger.warning("  Known-name injection OFF -- corpus carries no patient name columns; "
+            logger.warning("  Known-name injection OFF -- no name columns and no --names-path; "
                            "names rely on NER only (measured 8.91% patient-name leak)")
     have_shift_col = bool(shift_col) and shift_col in cols
     if surrogate_mode:
@@ -740,7 +756,9 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
                     list(zip(df_chunk['patient_first_name'].values,
                              df_chunk['patient_middle_name'].values,
                              df_chunk['patient_last_name'].values))
-                    if have_name_cols else [None] * len(df_chunk)
+                    if have_name_cols else
+                    ([names_lookup.get(str(p)) for p in df_chunk['person_id'].values]
+                     if names_lookup else [None] * len(df_chunk))
                 ))
             elif note_type == 'bi_clinicalnotes':
                 file_data = list(zip(
@@ -876,6 +894,10 @@ def main():
     parser.add_argument('--batch-timeout', type=int, default=60,
                         help='Seconds per sub-batch before FULL REDACTION (destroys the note). '
                              'Raise it for slow/long notes; timed-out keys are written to _retry/ for a second pass.')
+    parser.add_argument('--names-path', default=None,
+                        help="Parquet of person_id -> first/middle/last name, used to surrogate the "
+                             "PATIENT'S OWN name by identity. Without it names rest on NER alone, "
+                             "measured at an 8.91%% patient-name leak on a 2,000-note sample.")
     parser.add_argument('--only-keys', default=None,
                         help='Path (local or s3://) to a newline-separated list of de_id_filename values. '
                              'Process ONLY those notes — used to retry the _retry/ timeout queue.')
@@ -935,6 +957,7 @@ def main():
         note_type=args.note_type,
         batch_timeout=args.batch_timeout,
         only_keys=args.only_keys,
+        names_path=args.names_path,
         filename_col=filename_col,
         surrogate_mode=args.surrogate,
         default_shift=args.default_shift,
