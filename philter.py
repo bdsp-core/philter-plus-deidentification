@@ -1399,13 +1399,20 @@ class Philter:
                     # PUT-BACK: known clinical term that doubles as a surname. Restore unless the
                     # context marks a person. The patient's real name is separately injected from the
                     # structured record, so this does not expose the patient's own surname.
-                    if w in getattr(self, "_safe_ambig", ()):
+                    _is_prov = w in getattr(self, "_provider", ())
+                    if w in getattr(self, "_safe_ambig", ()) and not _is_prov:
                         safe_char.update(range(start, end)); return
                     # Name-dominant tier: only with positive clinical evidence after the token
                     # ("Thomas splint", "Stevens-Johnson syndrome"). Never restored on its own.
+                    # A token on the PROVIDER ROSTER needs STRONGER evidence than an ordinary
+                    # put-back term. _CTX_MED_AFTER fires on any following DIGIT, so "Thomas 3546"
+                    # (a name and a pager number) counted as clinical context and restored a real
+                    # provider name: 620 of 827 surviving provider occurrences came back this way.
+                    # A bare digit is not clinical evidence -- a named clinical noun or a dose with a
+                    # unit is.
                     if w in getattr(self, "_safe_ambig_strict", ()) and (
-                            _CTX_CLINICAL_AFTER.match(_after) or _CTX_MED_AFTER.match(_after)
-                            or _CTX_MED_WINDOW.search(_after)):
+                            _CTX_CLINICAL_AFTER.match(_after) or _CTX_MED_WINDOW.search(_after)
+                            or (_CTX_MED_AFTER.match(_after) and not _is_prov)):
                         safe_char.update(range(start, end)); return
                     if _CTX_CAMEL_MED.match(tok) and w not in self._names:
                         safe_char.update(range(start, end)); return   # "AlkPhos", "HgbA1c"
