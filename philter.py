@@ -1490,6 +1490,26 @@ class Philter:
         accession_spans = {}
         for m in accession.finditer(txt):
             accession_spans[m.start()] = m.end()
+        # LONG DIGIT RUNS -> DEFAULT DENY. Everything else about numbers here is default-ALLOW: a digit
+        # run survives unless some filter affirmatively tags it, and the CD part-of-speech rule exists
+        # precisely to keep "any number not included in earlier steps". Every identifier leak measured on
+        # the sample was a different way of failing to tag one -- parenthesised, behind an unusual label,
+        # or swallowed by the dose rule. Inverting the default closes the class instead of one shape at a
+        # time: no lab value, vital sign, dose or score is a bare 7+ digit integer, so such a run is an
+        # identifier unless it is one of the few genuinely numeric clinical notations, exempted here and
+        # covered by bench cases.
+        longnum_spans = {}
+        _exempt = set()
+        for _rx in getattr(self, "_safe_rx", []):          # genomic coordinates / ISCN / ratios
+            for m in _rx.finditer(txt):
+                _exempt.update(range(m.start(), m.end()))
+        # NDC drug codes (exactly 11 digits) are deliberately NOT exempted. An account or member number
+        # can also be 11 digits, so exempting the length to preserve a product code would reopen the leak
+        # class this rule exists to close. An NDC becoming a different 11-digit number costs little --
+        # the drug name sits next to it in the text -- while a kept identifier is unrecoverable.
+        for m in re.finditer(r"(?<![\d.\-/])\d{7,}(?![\d.])", txt):
+            if m.start() not in accession_spans and m.start() not in _exempt:
+                longnum_spans[m.start()] = m.end()
         # PHONE / FAX numbers -> a deterministic FAKE phone (hiding in plain sight), matched as a WHOLE
         # unit before the bare-number guard can keep the area code / exchange.
         phone = re.compile(r"(?:\+?1[-.\s])?(?:\(\d{3}\)\s?|\d{3}[-.\s])\d{3}[-.\s]\d{4}\b")
@@ -1549,6 +1569,10 @@ class Philter:
                 stop = accession_spans[i]
                 contents.append(self._fake_accession(txt[i:stop]))
                 i = last_marker = stop; continue
+            if i in longnum_spans:                                  # 7+ digit run -> fake digits (deny)
+                stop = longnum_spans[i]
+                contents.append(self._fake_digits(txt[i:stop]))
+                i = last_marker = stop; continue
             if i in phone_spans:                                    # PHONE -> fake phone
                 stop = phone_spans[i]
                 contents.append(self._fake_phone(txt[i:stop]))
@@ -1579,7 +1603,11 @@ class Philter:
                 start, stop = self.include_map.get_coords(infilename, i)
                 # an include range must never SWALLOW an identity-verified real name that falls inside it
                 # (Philter may mark a signature-block surname "safe"); clamp to the next known-name start.
-                nxt = min((k for k in known_spans if i < k < stop), default=stop)
+                # ...nor a long digit run: an include range STARTING before an identifier and ending after
+                # it skips the loop past the default-deny check entirely (last_marker jumps over it),
+                # which is how the final 6 leaks on the 2,000-note sample survived.
+                nxt = min((k for k in list(known_spans) + list(longnum_spans) if i < k < stop),
+                          default=stop)
                 contents.append(txt[i:nxt]); i = last_marker = nxt; continue
             if i in date_spans:                                     # DATE -> shifted date
                 stop = date_spans[i]
