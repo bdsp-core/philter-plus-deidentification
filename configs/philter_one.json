@@ -2421,6 +2421,14 @@
         "phi_type": "NAME"
     },
     {
+        "title": "Provider Roster",
+        "type": "set",
+        "exclude": true,
+        "filepath": "filters/blacklists/provider_roster.json",
+        "notes": "Real provider surnames from omop_prod.provider. Deliberately NOT pos-gated: the Lastnames Blacklist above only fires on an NNP tag, which is why ALL-CAPS signature blocks ('KRYSTAL DIMAYA, RN') survive. These are known real names, so they are redacted regardless of how the tagger reads them. Filtered against the medical and dictionary whitelists at build time so no clinical word can enter.",
+        "phi_type": "NAME"
+    },
+    {
         "title": "Find Names 1",
         "type": "regex_context",
         "exclude": true,

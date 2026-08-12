@@ -15,3 +15,7 @@ test_output_*.txt
 
 # Claude internal
 .claude/
+
+# PHI-DERIVED: the real provider roster, exported from omop_prod.provider inside the enclave.
+# It is a list of real people's names. Never commit it; rebuild it from the roster instead.
+filters/blacklists/provider_roster.json
