@@ -47,6 +47,10 @@ _CTX_MED_AFTER = re.compile(
 _CTX_PERSON_BEFORE = re.compile(
     r"\b(mr|mrs|ms|miss|dr|doctor|prof|attending|resident|rn|md|do|np|pa|by|per)\W{0,3}$", re.I)
 _CTX_PERSON_AFTER = re.compile(r"^\s*,?\s*(m\.?d|d\.?o|r\.?n|np|pa|phd|jr|sr|iii|ii|iv)\b", re.I)
+# Dose/unit context a few tokens away, for comma- or ampersand-separated medication lists
+# ("Senna, docusate 100 mg"). Adjacency-only missed these; the personal-context veto still applies.
+_CTX_MED_WINDOW = re.compile(
+    r"^[^.\n]{0,40}?\b\d+(\.\d+)?\s*(mg|mcg|ug|g|ml|unit|units|tab|tabs|tablet|cap|caps|capsule)\b", re.I)
 # camelCase medical tokens (AlkPhos, HgbA1c) are never personal names; guarded by the name check.
 _CTX_CAMEL_MED = re.compile(r"^[A-Z][a-z]+[A-Z][A-Za-z0-9]*$")
 # ---------------------------------------------------------------------------------------------
@@ -1292,6 +1296,14 @@ class Philter:
                     return set()
             self._safe_lower = _load("filters/whitelists/whitelist_stanford_medical.json")
             self._safe_any = _load("filters/whitelists/whitelist_medical_anycase.json")
+            # PUT-BACK LIST: clinical vocabulary that is ALSO a surname (senna, graves, crohn,
+            # parkinson, gravis — 6,897 terms from OMOP Drug/Condition intersected with the surname
+            # blacklist). These cannot go in _safe_any (that would stop the SURNAME being redacted
+            # anywhere) and requiring positive clinical context does not work either: MEASURED, 39 of
+            # 42 missed "Senna" occurrences were bare medication-list entries with no dose and no
+            # clinical noun to trigger on ("Senna, Colace, Dulcolax"). So the default is inverted for
+            # this set only: put the term BACK unless the surrounding text says it is a person.
+            self._safe_ambig = _load("filters/whitelists/whitelist_medical_ambiguous.json")
             # English stopwords / function words are NEVER PHI, but the medical dictionary omits many
             # short ones ("of", "to", "in"); without this, a function word Philter mis-tags (e.g. the
             # "of" in an "X of Y" org pattern) falls through to the fake-name fallback ("of" -> "edele").
@@ -1335,6 +1347,11 @@ class Philter:
                     return
                 if w in self._safe_any:                          # curated medical term -> keep even in a place
                     safe_char.update(range(start, end)); return
+                # PUT-BACK (any case): clinical vocabulary that doubles as a surname. Applied before the
+                # capitalisation logic because these terms appear lowercase too ("myasthenia gravis").
+                # Personal context is vetoed further down for the capitalised case.
+                if w in getattr(self, "_safe_ambig", ()) and tok[0].islower():
+                    safe_char.update(range(start, end)); return
                 if start in place_char:                          # a dictionary word INSIDE a place span
                     return                                       # ("Alto" of "Palo Alto") -> let it be faked
                 if w in self._safe_lower and (tok[0].islower() or w not in self._names):
@@ -1347,8 +1364,14 @@ class Philter:
                     if _CTX_PERSON_BEFORE.search(_before) or _CTX_PERSON_AFTER.match(_after):
                         return                                   # "Dr. Senna", "Senna, MD" -> person
                     if w in self._safe_lower and (_CTX_CLINICAL_AFTER.match(_after)
-                                                  or _CTX_MED_AFTER.match(_after)):
+                                                  or _CTX_MED_AFTER.match(_after)
+                                                  or _CTX_MED_WINDOW.search(_after)):
                         safe_char.update(range(start, end)); return   # "Senna 8.6 mg", "Bell palsy"
+                    # PUT-BACK: known clinical term that doubles as a surname. Restore unless the
+                    # context marks a person. The patient's real name is separately injected from the
+                    # structured record, so this does not expose the patient's own surname.
+                    if w in getattr(self, "_safe_ambig", ()):
+                        safe_char.update(range(start, end)); return
                     if _CTX_CAMEL_MED.match(tok) and w not in self._names:
                         safe_char.update(range(start, end)); return   # "AlkPhos", "HgbA1c"
             # pass A: the whole hyphen/apostrophe compound as blessed (Ki-67, Ber-EP4, tilt-table).
@@ -1362,6 +1385,18 @@ class Philter:
             for _rx in getattr(self, "_safe_rx", []):
                 for m in _rx.finditer(txt):
                     safe_char.update(range(m.start(), m.end()))
+            # DOSES AND MEASUREMENTS -> keep the NUMBER AND ITS UNIT.
+            # Surrogate mode replaces an un-typed number with a plausible DIFFERENT number, which is
+            # right for an MRN and dangerous for a dose: measured on a 2,000-note sample, 13.8% of notes
+            # had an altered dose (2.88% of all dose expressions), including 5 -> 25 and 1 -> 25. That is
+            # a silent five-fold error written into the de-identified record with nothing to flag it.
+            # The pre-existing decimal rule below covers "2.5 mg" but NOT the integer form "2 mg",
+            # which is why plain doses were corrupted while decimal ones survived.
+            for m in re.finditer(
+                    r"(?<![\w.])\d+(?:\.\d+)?(?:\s*[-–/]\s*\d+(?:\.\d+)?)*\s*"
+                    r"(?:mcg|mg|µg|ug|kg|gm|g|mL|ml|L|cc|units?|iu|mmol|mmols|meq|mEq|ng|pg|mmHg|%)"
+                    r"(?:\s*/\s*(?:hr|hrs|h|hour|kg|day|d|min|wk|week|m2|dose|24h))?", txt, re.I):
+                safe_char.update(range(m.start(), m.end()))
             # clinical measurements -> keep: dimensions ("1.5 x 2.0", "15x10x8"), standalone decimals
             # ("2.5", dose/size), and 0-10 pain/severity scores ("7/10").
             for m in re.finditer(r"(?<![\w.])\d+(?:\.\d+)?(?:\s*[xX]\s*\d+(?:\.\d+)?){1,2}(?![\w])|"
