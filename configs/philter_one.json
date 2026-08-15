@@ -29,6 +29,14 @@
         "notes": "These are words we beleive are safe"
     },
     {
+        "title": "eeg/psg domain terms safe",
+        "type": "set",
+        "exclude": false,
+        "filepath": "filters/whitelists/whitelist_eeg_psg_terms.json",
+        "pos": [],
+        "notes": "EEG/PSG technologist vocabulary absent from general medical dictionaries. Generated from arpa_ingest.annotations.vocabulary -- regenerate rather than hand-edit. Terms under 3 chars and state-code collisions (PA/OR/MD/IN) are deliberately excluded."
+    },
+    {
         "title": "molecular markers safe",
         "type": "regex",
         "exclude": false,
