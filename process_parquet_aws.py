@@ -418,7 +418,7 @@ def _process_batch_bi(batch_data):
     return results, status_records
 
 
-def save_checkpoint(checkpoint_path, processed_count, batch_num, completed_files=None):
+def save_checkpoint(checkpoint_path, processed_count, batch_num, completed_files=None, shard=''):
     """Save progress checkpoint."""
     checkpoint = {
         'processed_count': processed_count,
@@ -433,27 +433,27 @@ def save_checkpoint(checkpoint_path, processed_count, batch_num, completed_files
         key = key.rstrip('/')
         s3.put_object(
             Bucket=bucket,
-            Key=f"{key}/checkpoint.json",
+            Key=f"{key}/checkpoint{shard}.json",
             Body=json.dumps(checkpoint, indent=2)
         )
     else:
         os.makedirs(checkpoint_path, exist_ok=True)
-        local_file = os.path.join(checkpoint_path, 'checkpoint.json')
+        local_file = os.path.join(checkpoint_path, f'checkpoint{shard}.json')
         with open(local_file, 'w') as f:
             json.dump(checkpoint, f, indent=2)
 
 
-def load_checkpoint(checkpoint_path):
+def load_checkpoint(checkpoint_path, shard=''):
     """Load progress checkpoint."""
     try:
         if checkpoint_path.startswith('s3://'):
             s3 = boto3.client('s3')
             bucket, key = checkpoint_path.replace('s3://', '').split('/', 1)
             key = key.rstrip('/')
-            obj = s3.get_object(Bucket=bucket, Key=f"{key}/checkpoint.json")
+            obj = s3.get_object(Bucket=bucket, Key=f"{key}/checkpoint{shard}.json")
             return json.loads(obj['Body'].read())
         else:
-            local_file = os.path.join(checkpoint_path, 'checkpoint.json')
+            local_file = os.path.join(checkpoint_path, f'checkpoint{shard}.json')
             if os.path.exists(local_file):
                 with open(local_file, 'r') as f:
                     return json.load(f)
@@ -462,7 +462,7 @@ def load_checkpoint(checkpoint_path):
     return None
 
 
-def write_parquet_batch(results, output_path, batch_num, text_col='NoteTXT', note_type='clinicalnotes'):
+def write_parquet_batch(results, output_path, batch_num, text_col='NoteTXT', note_type='clinicalnotes', shard=''):
     """Write results to Parquet file."""
     if note_type == 'bi_clinicalnotes':
         df = pd.DataFrame(results, columns=['DeidentifiedName', 'TEXT', 'TYPE', 'CREATIONINSTANT', 'COUNT'])
@@ -475,7 +475,7 @@ def write_parquet_batch(results, output_path, batch_num, text_col='NoteTXT', not
                                             'ShiftedContactDate', text_col, 'de_id_filename'])
     table = pa.Table.from_pandas(df)
 
-    output_file = f"{output_path.rstrip('/')}/batch_{batch_num:06d}.parquet"
+    output_file = f"{output_path.rstrip('/')}/batch{shard}_{batch_num:06d}.parquet"
 
     if output_path.startswith('s3://'):
         # Write to S3
@@ -531,7 +531,7 @@ def write_status_csv(status_records, output_path, partition_id, id_col='NoteCSNI
         writer.writerows(status_records)
 
 
-def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None, id_col='NoteCSNID', text_col='NoteTXT', note_type='clinicalnotes', filename_col='de_id_filename', surrogate_mode=True, default_shift=0, shift_col=None, batch_timeout=60, only_keys=None, names_path=None):
+def process_partition(input_path, output_path, partition_id, num_workers, batch_size, philter_config, file_start=0, file_end=None, id_col='NoteCSNID', text_col='NoteTXT', note_type='clinicalnotes', filename_col='de_id_filename', surrogate_mode=True, default_shift=0, shift_col=None, batch_timeout=60, only_keys=None, names_path=None, shard_index=0, shard_total=1, chunk_rows=500000):
     """
     Process a partition of Parquet files.
 
@@ -555,7 +555,9 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     logger.warning("=" * 80)
 
     # Load checkpoint to find already-completed files
-    checkpoint = load_checkpoint(output_path)
+    # tag every artefact with the shard so parallel shards of one file cannot collide
+    _shard_tag = f'_s{shard_index}of{shard_total}' if shard_total > 1 else ''
+    checkpoint = load_checkpoint(output_path, shard=_shard_tag)
     completed_files = set()
     total_processed = 0
     batch_num = 0
@@ -632,8 +634,12 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         batch_fn = _process_batch
 
     # Verify schema from first remaining file
-    first_table = pq.read_table(remaining_files[0])
-    cols = first_table.column_names
+    # SCHEMA ONLY. This was pq.read_table(), which loads the ENTIRE file to read its column names --
+    # fine for a 180 MB partition, fatal for mgb_enterprise's 35.6 GiB one: the kernel OOM-killed the
+    # process ~30s in, silently (an OOM kill logs nothing), so the unit appeared to "finish" instantly
+    # and produced no output. It is why mgb_enterprise sat at 0% while every other source progressed.
+    # read_schema reads the footer only.
+    cols = list(pq.read_schema(remaining_files[0]).names)
     missing = [c for c in NEED_COLS if c not in cols]
     if missing:
         logger.error(f"Missing columns: {missing}")
@@ -675,7 +681,6 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     else:
         logger.warning("  Surrogate mode OFF (legacy asterisk redaction)")
     logger.warning(f"  Columns: {cols}")
-    del first_table
 
     # Initialize worker pool
     logger.warning(f"\nInitializing {num_workers} workers...")
@@ -696,7 +701,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
     total_records = 0
 
     # Chunked reading: read large files in 500K-row chunks to avoid 32GB+ memory spikes
-    CHUNK_ROWS = 500000
+    CHUNK_ROWS = chunk_rows
     SUB_BATCH_SIZE = 20
     WRITE_THRESHOLD = 100000  # Write every 100K results to cap memory
     all_status_records = []
@@ -716,7 +721,27 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
             _fh = None
             pf = pq.ParquetFile(parquet_file)
 
-        file_records = pf.metadata.num_rows
+        # SHARDING. A parquet file is stored as independent row groups, so N workers can each take
+        # every Nth row group of the SAME file and never overlap. Without this, one 33.5M-note
+        # partition is a single indivisible unit taking ~7 days, and the whole fleet waits on it while
+        # most workers sit idle -- measured: 40 of 63 workers finished while 20 ground on enterprise.
+        _rgs = list(range(pf.metadata.num_row_groups))
+        if shard_total > 1:
+            _rgs = [r for r in _rgs if r % shard_total == shard_index]
+            # A file with fewer row groups than shards leaves some shards with NOTHING. Skip cleanly:
+            # iter_batches(row_groups=[]) hangs rather than returning empty, which stalled a worker
+            # silently. Small sources (mgb_neuro_pre has ONE row group) are unshardable by construction.
+            if not _rgs:
+                logger.warning(f"  Shard {shard_index}/{shard_total}: no row groups in this file "
+                               f"({pf.metadata.num_row_groups} total) — nothing to do, skipping")
+                if _fh is not None:
+                    _fh.close()
+                continue
+            file_records = sum(pf.metadata.row_group(r).num_rows for r in _rgs)
+            logger.warning(f"  Shard {shard_index}/{shard_total}: {len(_rgs)} of "
+                           f"{pf.metadata.num_row_groups} row groups, {file_records:,} records")
+        else:
+            file_records = pf.metadata.num_rows
         total_records += file_records
         num_chunks = (file_records + CHUNK_ROWS - 1) // CHUNK_ROWS
         logger.warning(f"  File has {file_records:,} records, reading in {num_chunks} chunk(s) of {CHUNK_ROWS:,}")
@@ -726,7 +751,8 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         sub_batches_done_total = 0
         chunk_num = 0
 
-        for record_batch in pf.iter_batches(batch_size=CHUNK_ROWS, columns=NEED_COLS):
+        for record_batch in pf.iter_batches(batch_size=CHUNK_ROWS, columns=NEED_COLS,
+                                            row_groups=_rgs):
             chunk_num += 1
             df_chunk = record_batch.to_pandas()
             if only_set is not None:
@@ -805,7 +831,8 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
                 # Intermediate write to cap memory
                 if len(all_results) >= WRITE_THRESHOLD:
                     batch_num += 1
-                    write_parquet_batch(all_results, output_path, batch_num, text_col=text_col, note_type=note_type)
+                    write_parquet_batch(all_results, output_path, batch_num, text_col=text_col, note_type=note_type,
+                                        shard=_shard_tag)
                     all_results = []
                     gc.collect()
 
@@ -827,7 +854,8 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
         # Write remaining results for this file
         if all_results:
             batch_num += 1
-            write_parquet_batch(all_results, output_path, batch_num, text_col=text_col, note_type=note_type)
+            write_parquet_batch(all_results, output_path, batch_num, text_col=text_col, note_type=note_type,
+                                        shard=_shard_tag)
             all_results = []
 
         # Flush remaining status records for this file
@@ -840,7 +868,7 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
 
         # Mark this file as completed in checkpoint
         completed_files.add(file_basename)
-        save_checkpoint(output_path, total_processed, batch_num, list(completed_files))
+        save_checkpoint(output_path, total_processed, batch_num, list(completed_files), shard=_shard_tag)
 
         file_elapsed = (datetime.now() - file_start_time).total_seconds()
 
@@ -855,7 +883,8 @@ def process_partition(input_path, output_path, partition_id, num_workers, batch_
 
     # Write any remaining results
     if all_results:
-        write_parquet_batch(all_results, output_path, batch_num, text_col=text_col, note_type=note_type)
+        write_parquet_batch(all_results, output_path, batch_num, text_col=text_col, note_type=note_type,
+                                        shard=_shard_tag)
 
     # Cleanup
     pool.close()
@@ -894,6 +923,18 @@ def main():
     parser.add_argument('--batch-timeout', type=int, default=60,
                         help='Seconds per sub-batch before FULL REDACTION (destroys the note). '
                              'Raise it for slow/long notes; timed-out keys are written to _retry/ for a second pass.')
+    parser.add_argument('--chunk-rows', type=int, default=500000,
+                        help='Rows read into memory at once. MEASURED: 500,000 rows of mgb_enterprise '
+                             '(35.6 GiB partition, ~2.4 KB/note) OOM-killed a 61 GB instance -- the chunk '
+                             'becomes an Arrow batch, then a pandas copy, then a list of Python tuples '
+                             'holding the text, several GB per chunk, alongside a ~5 GB name lookup and 32 '
+                             'philter workers. Invisible on a 180 MB file; fatal on a 35.6 GiB one.')
+    parser.add_argument('--shard-index', type=int, default=0,
+                        help='Process only row groups where (rg_index %% shard-total == shard-index). '
+                             'Lets several workers split ONE parquet file, which is what makes a 33.5M-note '
+                             'partition divisible -- each corpus partition is a single file, so file-level '
+                             'splitting cannot touch it.')
+    parser.add_argument('--shard-total', type=int, default=1, help='Number of shards splitting each file')
     parser.add_argument('--names-path', default=None,
                         help="Parquet of person_id -> first/middle/last name, used to surrogate the "
                              "PATIENT'S OWN name by identity. Without it names rest on NER alone, "
@@ -958,6 +999,9 @@ def main():
         batch_timeout=args.batch_timeout,
         only_keys=args.only_keys,
         names_path=args.names_path,
+        chunk_rows=args.chunk_rows,
+        shard_index=args.shard_index,
+        shard_total=args.shard_total,
         filename_col=filename_col,
         surrogate_mode=args.surrogate,
         default_shift=args.default_shift,
