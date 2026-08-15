@@ -1,3 +1,48 @@
+# philter-plus-deidentification
+
+De-identification for BDSP clinical notes. **Surrogate mode**: PHI is replaced with realistic fakes —
+a name becomes a different name, a date shifts by the patient's canonical offset — rather than blacked
+out. A residual leak is therefore not self-announcing: a real name left among thousands of plausible
+fakes is not identifiable *as* real.
+
+## One branch
+
+**`main` is the only branch.** History before 2026-08-15 is preserved in the tag
+`pre-consolidation-2026-08-15`. The `martinos` branch holds Martinos-cluster SLURM config (last
+touched 2026-02) and is a different execution environment, not a second copy of the pipeline.
+
+This matters here specifically: eponym put-back rules that had been written once appeared to be
+missing because the work sat on a second branch. With a team using this, a second branch is how the
+wrong code gets run.
+
+## Before you change anything
+
+```bash
+python loom/deid_bench.py    # in db_phi_aurora — 35 synthetic cases, no PHI, runs in seconds
+```
+
+Every defect a human found by reading real notes is a case in that bench: `Senna`→`Duggin`,
+`AlkPhos`→`Tsui`, `q8hr`→`q8woldeyohannes`, `Oral`→`Olle`, `5mg`→`25mg`, `Thomas splint`→`Bell splint`.
+They are cheap to reintroduce and expensive to notice.
+
+## The three name mechanisms
+
+| whose name | mechanism | why |
+|---|---|---|
+| the **patient** | `known_names`, supplied per note via `--names-path` | NER misses names it does not recognise; measured 8.91% leak without it, ~0.1% with it |
+| **providers** | `filters/blacklists/provider_roster.json`, deliberately NOT POS-gated | the surname blacklist only fires on an `NNP` tag, so ALL-CAPS signature blocks survive; 45% of roster names are absent from the 161k census list |
+| everyone else | NER + census lists | no ground truth available |
+
+`--names-path` is not optional for a real run. Without it philter silently reverts to NER-only names.
+
+## Deployment
+
+Do not hand-build the fleet tarball — use `db_phi_aurora/loom/deploy_fleet.sh`, which refuses to
+publish unless this repo is on `main`, clean and pushed, and stamps the commit into the artifact.
+
+
+---
+
 # Philter De-identification Pipeline
 
 De-identifies clinical notes and imaging reports stored as Parquet files in AWS S3, using the **Philter** NLP engine. Built to process **800+ million medical records** across multiple EC2 instances in parallel — reading directly from S3 and writing back to S3 with no local disk staging.
