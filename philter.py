@@ -51,16 +51,71 @@ _CTX_MED_AFTER = re.compile(
 _CTX_PERSON_BEFORE = re.compile(
     r"\b(mr|mrs|ms|miss|dr|doctor|prof|attending|resident|rn|md|do|np|pa|by|per)\W{0,3}$", re.I)
 # Anatomy named after a person, where the eponym FOLLOWS the anatomical noun: "circle of Willis",
-# "foramen of Monro", "vein of Galen", "canal of Dorello", "foramina of Luschka and Magendie". The
-# noun list is short and specific on purpose, so "... of Smith" in ordinary prose is not affected.
+# "foramen of Monro", "vein of Galen", "artery of Heubner", "foramina of Luschka and Magendie".
+# Reports also drop the "of" ("foramen Monro"). The noun list is short and specific on purpose,
+# so "... of Smith" in ordinary prose is not affected.
 _CTX_ANATOMY_BEFORE = re.compile(
-    r"\b(circle|foramen|foramina|vein|veins|aqueduct|fissure|cistern|cave|canal|gyrus|gyri|pouch|cleft|"
-    r"loop|ganglion)\s+of\s+(?:the\s+)?(?:[A-Za-z]+\s+and\s+)?$", re.I)
+    r"\b(circle|foramen|foramina|vein|veins|artery|aqueduct|fissure|cistern|cave|canal|gyrus|gyri|pouch|cleft|"
+    r"loop|ganglion)\s+(?:of\s+)?(?:the\s+)?(?:[A-Za-z]+\s+and\s+)?$", re.I)
 # ...and where the anatomical noun FOLLOWS the eponym but is not in _CTX_CLINICAL_AFTER:
-# "Meckel's cave", "Heschl gyrus", "Rathke cleft", "Virchow-Robin spaces", "Lewy bodies".
+# "Meckel's cave", "Heschl gyrus", "Rathke cleft", "Chiari II malformation", "Wernicke's area".
 _CTX_ANATOMY_AFTER = re.compile(
-    r"^(?:'s)?[\s\-]*(cave|gyrus|gyri|pouch|cleft|fissure|aqueduct|cistern|vein|veins|spaces|"
-    r"malformation|turcica|embolization|embolisation|bodies)\b", re.I)
+    r"^(?:['\u2019]s)?[\s\-]*(?:(?:type\s+)?(?:[IV]{1,3}|[1-4])\s+)?(cave|gyrus|gyri|pouch|cleft|fissure|aqueduct|cistern|"
+    r"vein|veins|spaces|malformation|turcica|embolization|embolisation)\b"
+    r"|^(?:['\u2019]s|s)\s+(area|horn|canal|cave)\b", re.I)
+# Two-name eponyms: either name is clinical when its partner is next to it ("Sturge-Weber",
+# "Spetzler-Martin grade", "Miller Fisher", "Pierre Robin sequence", "Lewy body").
+_EPONYM_PARTNERS = {
+    "weber": {"sturge", "osler", "rendu"}, "sturge": {"weber"}, "martin": {"spetzler"}, "spetzler": {"martin"},
+    "fisher": {"miller"}, "miller": {"fisher"}, "robin": {"virchow", "pierre"}, "virchow": {"robin"},
+    "pierre": {"robin"}, "korsakoff": {"wernicke"}, "wernicke": {"korsakoff"}, "jakob": {"creutzfeldt", "creutzfeld"},
+    "creutzfeldt": {"jakob"}, "creutzfeld": {"jakob"}, "walker": {"dandy"}, "dandy": {"walker"}, "hess": {"hunt"},
+    "hunt": {"hess"}, "bignami": {"marchiafava"}, "marchiafava": {"bignami"}, "lindau": {"hippel"},
+    "hippel": {"lindau"}, "fraumeni": {"li"}, "chester": {"erdheim"}, "erdheim": {"chester"},
+    "dorfman": {"rosai"}, "rosai": {"dorfman"}, "chiari": {"arnold", "budd"}, "arnold": {"chiari"},
+    "lewy": {"body", "bodies"},
+}
+
+
+def _has_eponym_partner(w, before, after):
+    partners = _EPONYM_PARTNERS.get(w)
+    if not partners:
+        return False
+    b = re.findall(r"[a-z]+", before.lower())[-1:]
+    a = re.findall(r"[a-z]+", after.lower())[:1]
+    return bool(partners & set(b + a))
+
+
+# Medical compounds that no word list can enumerate: "multisequence" = multi + sequence,
+# "retrodental" = retro + dental, "frontoparietotemporal" = fronto + parieto + temporal.
+_MED_PREFIXES = (
+    "multi", "retro", "post", "pre", "non", "peri", "para", "sub", "supra", "infra", "intra", "extra", "inter",
+    "trans", "micro", "macro", "hypo", "hyper", "hemi", "semi", "bi", "tri", "re", "co", "anti", "pseudo", "neuro",
+    "pachy", "lepto", "un", "over", "under", "mid", "antero", "postero", "infero", "supero", "latero", "medio",
+    "ventro", "dorso", "fronto", "parieto", "temporo", "occipito", "cerebello", "thalamo", "striato", "ponto",
+    "calloso", "cortico", "spino", "cranio", "cervico", "basi", "oto", "atlanto", "ganglio", "steno", "iso",
+    "poly", "pan", "endo", "epi", "ecto", "meso", "auto", "hetero", "homo", "angio", "vasculo", "veno", "arterio")
+_PLURAL_ABBREV = re.compile(r"^[A-Z]{2,6}s$")
+# Eponyms that take a type or grade number, which must not be read as a personal suffix ("Smith II").
+_NUMBERED_EPONYMS = {"chiari", "fazekas", "fisher", "koos", "knosp", "simpson", "spetzler", "hess"}
+_CTX_TYPE_NUMBER = re.compile(r"^\s*(?:type\s+|grade\s+)?(?:[IV]{1,3}|[0-5](?:\.5)?)\b", re.I)
+
+
+def _is_medical_compound(w, vocabs, _depth=0, strict=False):
+    """True for prefix + known word. strict (used for Capitalized tokens, which could be surnames)
+    needs a prefix of 3+ letters and a remainder of 5+ letters, so "Bishop" and "Coburn" do not pass."""
+    def known(x):
+        return len(x) >= (5 if strict else 4) and any(x in v or (x.endswith("s") and x[:-1] in v) for v in vocabs)
+    for p in _MED_PREFIXES:
+        if strict and len(p) < 3:
+            continue
+        if w.startswith(p) and len(w) >= len(p) + 4:
+            rest = w[len(p):]
+            if known(rest) or (_depth < 1 and _is_medical_compound(rest, vocabs, _depth + 1, strict)):
+                return True
+    return False
+
+
 _CTX_PERSON_AFTER = re.compile(r"^\s*,?\s*(m\.?d|d\.?o|r\.?n|np|pa|phd|jr|sr|iii|ii|iv)\b", re.I)
 # Dose/unit context a few tokens away, for comma- or ampersand-separated medication lists
 # ("Senna, docusate 100 mg"). Adjacency-only missed these; the personal-context veto still applies.
@@ -1389,7 +1444,18 @@ class Philter:
                 # restorations with personal context present in a 2,000-note sample.
                 _before = txt[max(0, start - 24):start]
                 _after = txt[end:end + 28]
-                _is_person = bool(_CTX_PERSON_BEFORE.search(_before) or _CTX_PERSON_AFTER.match(_after))
+                _is_person = bool(_CTX_PERSON_BEFORE.search(_before) or (
+                    _CTX_PERSON_AFTER.match(_after)
+                    and not _CTX_ANATOMY_AFTER.match(_after)                      # "Chiari II malformation"
+                    and not (w in _NUMBERED_EPONYMS and _CTX_TYPE_NUMBER.match(_after))))   # "Chiari II", "Fazekas 2"
+                # Anatomy named after a person. Checked before the place rule below, because "in Meckel's
+                # cave" and "at Wernicke's area" look like addresses to the place tagger.
+                if tok[0].isupper() and not _is_person and (
+                        _CTX_ANATOMY_BEFORE.search(txt[max(0, start - 40):start])
+                        or _CTX_ANATOMY_AFTER.match(_after)
+                        or _has_eponym_partner(w, _before, _after)
+                        or (w in _NUMBERED_EPONYMS and _CTX_TYPE_NUMBER.match(_after))):
+                    safe_char.update(range(start, end)); return
                 # PUT-BACK (any case): clinical vocabulary that doubles as a surname. Applied before the
                 # capitalisation logic because these terms appear lowercase too ("myasthenia gravis").
                 if w in getattr(self, "_safe_ambig", ()) and tok[0].islower() and not _is_person:
@@ -1398,14 +1464,21 @@ class Philter:
                     return                                       # ("Alto" of "Palo Alto") -> let it be faked
                 if w in self._safe_lower and (tok[0].islower() or w not in self._names):
                     safe_char.update(range(start, end)); return
+                if not _is_person and w not in self._names and (
+                        tok.islower() or tok.isupper() or tok.istitle() or _PLURAL_ABBREV.match(tok)):
+                    _vocabs = (self._safe_lower, self._safe_any)
+                    _title = tok.istitle() and not tok.isupper()               # sentence-initial: stricter test
+                    if (_is_medical_compound(w, _vocabs, strict=_title)        # "multisequence", "retrodental"
+                            # "MCAs", "MRAs", "CTs": the plural of a capital-letter abbreviation, unless the
+                            # singular is itself a known name or a provider
+                            or (_PLURAL_ABBREV.match(tok) and w[:-1] not in self._names
+                                and w[:-1] not in getattr(self, "_provider", ()))):
+                        safe_char.update(range(start, end)); return
                 # CONTEXT RULE — the token is Capitalized AND doubles as a surname, so the lists above
                 # deliberately refused it. Put it back only if the surrounding text is clinical.
                 if tok[0].isupper():
                     if _is_person:
                         return                                   # "Dr. Senna", "Senna, MD" -> person
-                    if (_CTX_ANATOMY_BEFORE.search(txt[max(0, start - 40):start])
-                            or _CTX_ANATOMY_AFTER.match(_after)):
-                        safe_char.update(range(start, end)); return   # "circle of Willis", "Meckel's cave"
                     if w in self._safe_lower and (_CTX_CLINICAL_AFTER.match(_after)
                                                   or _CTX_MED_AFTER.match(_after)
                                                   or _CTX_MED_WINDOW.search(_after)):
@@ -1545,7 +1618,8 @@ class Philter:
                     continue
                 # A roster surname in an anatomical phrase is anatomy: "circle of Willis", "vein of Galen".
                 if (_CTX_ANATOMY_BEFORE.search(txt[max(0, m.start() - 40):m.start()])
-                        or _CTX_ANATOMY_AFTER.match(txt[m.end():m.end() + 28])):
+                        or _CTX_ANATOMY_AFTER.match(txt[m.end():m.end() + 28])
+                        or _has_eponym_partner(_w, txt[max(0, m.start() - 24):m.start()], txt[m.end():m.end() + 28])):
                     continue
                 # A roster surname that is ALSO curated clinical vocabulary keeps its clinical sense:
                 # "Thomas splint" is a splint even when a Dr. Thomas exists. Caught by the bench, which
