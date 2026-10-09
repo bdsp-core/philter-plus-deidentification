@@ -73,8 +73,9 @@ _EPONYM_PARTNERS = {
     "hunt": {"hess"}, "bignami": {"marchiafava"}, "marchiafava": {"bignami"}, "lindau": {"hippel"},
     "hippel": {"lindau"}, "fraumeni": {"li"}, "chester": {"erdheim"}, "erdheim": {"chester"},
     "dorfman": {"rosai"}, "rosai": {"dorfman"}, "chiari": {"arnold", "budd"}, "arnold": {"chiari"},
-    "lewy": {"body", "bodies"},
+    "lewy": {"body", "bodies"}, "ramsay": {"hunt"}, "tolosa": {"hunt"},
 }
+_EPONYM_PARTNERS["hunt"] = {"hess", "ramsay", "tolosa"}
 
 
 def _has_eponym_partner(w, before, after):
@@ -96,6 +97,31 @@ _MED_PREFIXES = (
     "calloso", "cortico", "spino", "cranio", "cervico", "basi", "oto", "atlanto", "ganglio", "steno", "iso",
     "poly", "pan", "endo", "epi", "ecto", "meso", "auto", "hetero", "homo", "angio", "vasculo", "veno", "arterio")
 _PLURAL_ABBREV = re.compile(r"^[A-Z]{2,6}s$")
+# Endings that mark a lower-case word as medical: procedures, conditions, enzymes, drug classes.
+_MED_SUFFIX = re.compile(
+    r"(ostomy|otomy|ectomy|plasty|pexy|rrhaphy|graphy|scopy|scopic|itis|osis|oses|omas?|omata|pathy|pathic|penia|"
+    r"plegia|paresis|algia|emia|uria|trophy|trophic|plasia|plastic|genic|genesis|lysis|lytic|oidal|iform|"
+    r"ase|mab|nib|statin|cillin|mycin|floxacin|pril|sartan|olol|azepam|platin|rubicin|taxel)$")
+
+
+def _clin_after(after):
+    """_CTX_CLINICAL_AFTER, allowing a possessive first: "Wilson's disease", "Bell's palsy"."""
+    return _CTX_CLINICAL_AFTER.match(re.sub(r"^['\u2019]s\b", "", after))
+
+
+def _near_index(words):
+    """The words plus every single-letter deletion of each, for near-miss spelling lookups."""
+    out = set()
+    for w in words:
+        if len(w) >= 6:
+            out.add(w)
+            out.update(w[:i] + w[i + 1:] for i in range(len(w)))
+    return out
+
+
+def _near_report_word(w, index):
+    """True if w is within about one edit of a common report word: "decrased", "subactue", "nornal"."""
+    return w in index or any((w[:i] + w[i + 1:]) in index for i in range(len(w)))
 # Eponyms that take a type or grade number, which must not be read as a personal suffix ("Smith II").
 _NUMBERED_EPONYMS = {"chiari", "fazekas", "fisher", "koos", "knosp", "simpson", "spetzler", "hess"}
 _CTX_TYPE_NUMBER = re.compile(r"^\s*(?:type\s+|grade\s+)?(?:[IV]{1,3}|[0-5](?:\.5)?)\b", re.I)
@@ -105,7 +131,8 @@ def _is_medical_compound(w, vocabs, _depth=0, strict=False):
     """True for prefix + known word. strict (used for Capitalized tokens, which could be surnames)
     needs a prefix of 3+ letters and a remainder of 5+ letters, so "Bishop" and "Coburn" do not pass."""
     def known(x):
-        return len(x) >= (5 if strict else 4) and any(x in v or (x.endswith("s") and x[:-1] in v) for v in vocabs)
+        forms = [x] + [x[:-len(s)] for s in ("s", "es", "ly", "ed", "ing") if x.endswith(s) and len(x) - len(s) >= 4]
+        return len(x) >= (5 if strict else 4) and any(f in v for f in forms for v in vocabs)
     for p in _MED_PREFIXES:
         if strict and len(p) < 3:
             continue
@@ -1378,6 +1405,10 @@ class Philter:
                 except Exception:
                     return set()
             self._safe_lower = _load("filters/whitelists/whitelist_stanford_medical.json")
+            # Words that at least five different patients' radiology reports write in lower case and that
+            # are on no name list: report vocabulary, including recurrent misspellings.
+            self._safe_lower |= _load("filters/whitelists/whitelist_radiology_corpus.json")
+            self._report_index = _near_index(_load("filters/whitelists/report_vocabulary_common.json"))
             self._safe_any = _load("filters/whitelists/whitelist_medical_anycase.json")
             # PUT-BACK LIST: clinical vocabulary that is ALSO a surname (senna, graves, crohn,
             # parkinson, gravis — 6,897 terms from OMOP Drug/Condition intersected with the surname
@@ -1464,22 +1495,26 @@ class Philter:
                     return                                       # ("Alto" of "Palo Alto") -> let it be faked
                 if w in self._safe_lower and (tok[0].islower() or w not in self._names):
                     safe_char.update(range(start, end)); return
+                if (_PLURAL_ABBREV.match(tok) and not _is_person and w[:-1] not in self._names
+                        and w[:-1] not in getattr(self, "_provider", ())):
+                    safe_char.update(range(start, end)); return               # "MCAs", "MRAs", "CTs"
+                # Lower-case words only: a medical ending, or a near-miss spelling of a common report word.
+                if tok.islower() and not _is_person and w not in self._names and (
+                        (len(w) >= 8 and _MED_SUFFIX.search(w))               # "cystoventriculostomy"
+                        or (len(w) >= 6 and _near_report_word(w, self._report_index))):   # "decrased", "subactue"
+                    safe_char.update(range(start, end)); return
                 if not _is_person and w not in self._names and (
-                        tok.islower() or tok.isupper() or tok.istitle() or _PLURAL_ABBREV.match(tok)):
+                        tok.islower() or tok.isupper() or tok.istitle()):
                     _vocabs = (self._safe_lower, self._safe_any)
                     _title = tok.istitle() and not tok.isupper()               # sentence-initial: stricter test
-                    if (_is_medical_compound(w, _vocabs, strict=_title)        # "multisequence", "retrodental"
-                            # "MCAs", "MRAs", "CTs": the plural of a capital-letter abbreviation, unless the
-                            # singular is itself a known name or a provider
-                            or (_PLURAL_ABBREV.match(tok) and w[:-1] not in self._names
-                                and w[:-1] not in getattr(self, "_provider", ()))):
+                    if _is_medical_compound(w, _vocabs, strict=_title):        # "multisequence", "retrodental"
                         safe_char.update(range(start, end)); return
                 # CONTEXT RULE — the token is Capitalized AND doubles as a surname, so the lists above
                 # deliberately refused it. Put it back only if the surrounding text is clinical.
                 if tok[0].isupper():
                     if _is_person:
                         return                                   # "Dr. Senna", "Senna, MD" -> person
-                    if w in self._safe_lower and (_CTX_CLINICAL_AFTER.match(_after)
+                    if w in self._safe_lower and (_clin_after(_after)
                                                   or _CTX_MED_AFTER.match(_after)
                                                   or _CTX_MED_WINDOW.search(_after)):
                         safe_char.update(range(start, end)); return   # "Senna 8.6 mg", "Bell palsy"
@@ -1498,7 +1533,7 @@ class Philter:
                     # A bare digit is not clinical evidence -- a named clinical noun or a dose with a
                     # unit is.
                     if w in getattr(self, "_safe_ambig_strict", ()) and (
-                            _CTX_CLINICAL_AFTER.match(_after) or _CTX_MED_WINDOW.search(_after)
+                            _clin_after(_after) or _CTX_MED_WINDOW.search(_after)
                             or (_CTX_MED_AFTER.match(_after) and not _is_prov)):
                         safe_char.update(range(start, end)); return
                     if _CTX_CAMEL_MED.match(tok) and w not in self._names:
@@ -1626,7 +1661,7 @@ class Philter:
                 # is the same failure as a patient named Foley losing "Foley catheter".
                 if _w in _prov_med:
                     _aft = txt[m.end():m.end() + 28]
-                    if _CTX_CLINICAL_AFTER.match(_aft) or _CTX_MED_WINDOW.search(_aft):
+                    if _clin_after(_aft) or _CTX_MED_WINDOW.search(_aft):
                         continue
                 provider_spans[m.start()] = m.end()
         longnum_spans = {}
