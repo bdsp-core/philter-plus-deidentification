@@ -62,7 +62,8 @@ _CTX_ANATOMY_BEFORE = re.compile(
 _CTX_ANATOMY_AFTER = re.compile(
     r"^(?:['\u2019]s)?[\s\-]*(?:(?:type\s+)?(?:[IV]{1,3}|[1-4])\s+)?(cave|gyrus|gyri|pouch|cleft|fissure|aqueduct|cistern|"
     r"vein|veins|spaces|malformation|turcica|embolization|embolisation)\b"
-    r"|^(?:['\u2019]s|s)\s+(area|horn|canal|cave)\b", re.I)
+    r"|^(?:['\u2019]s|s)\s+(area|horn|canals?|cave|type|disease|syndrome|dementia|palsy|paralysis|paresis|"
+    r"concentric|sign|phenomenon|tumou?r|malformation|encephalopathy|aphasia)\b|^-like\b", re.I)
 # Two-name eponyms: either name is clinical when its partner is next to it ("Sturge-Weber",
 # "Spetzler-Martin grade", "Miller Fisher", "Pierre Robin sequence", "Lewy body").
 _EPONYM_PARTNERS = {
@@ -73,8 +74,9 @@ _EPONYM_PARTNERS = {
     "hunt": {"hess"}, "bignami": {"marchiafava"}, "marchiafava": {"bignami"}, "lindau": {"hippel"},
     "hippel": {"lindau"}, "fraumeni": {"li"}, "chester": {"erdheim"}, "erdheim": {"chester"},
     "dorfman": {"rosai"}, "rosai": {"dorfman"}, "chiari": {"arnold", "budd"}, "arnold": {"chiari"},
-    "lewy": {"body", "bodies"}, "ramsay": {"hunt"}, "tolosa": {"hunt"},
+    "lewy": {"body", "bodies"}, "ramsay": {"hunt"}, "tolosa": {"hunt"}, "warburg": {"walker"},
 }
+_EPONYM_PARTNERS["walker"] = {"dandy", "warburg"}
 _EPONYM_PARTNERS["hunt"] = {"hess", "ramsay", "tolosa"}
 
 
@@ -1485,7 +1487,10 @@ class Philter:
                         _CTX_ANATOMY_BEFORE.search(txt[max(0, start - 40):start])
                         or _CTX_ANATOMY_AFTER.match(_after)
                         or _has_eponym_partner(w, _before, _after)
-                        or (w in _NUMBERED_EPONYMS and _CTX_TYPE_NUMBER.match(_after))):
+                        or (w in _NUMBERED_EPONYMS and _CTX_TYPE_NUMBER.match(_after))
+                        # a curated eponym followed by a clinical noun, before "in Wilson" is taken for a place
+                        or ((w in getattr(self, "_safe_ambig_strict", ()) or w in getattr(self, "_safe_ambig", ()))
+                            and _clin_after(_after))):
                     safe_char.update(range(start, end)); return
                 # PUT-BACK (any case): clinical vocabulary that doubles as a surname. Applied before the
                 # capitalisation logic because these terms appear lowercase too ("myasthenia gravis").
@@ -1495,6 +1500,8 @@ class Philter:
                     return                                       # ("Alto" of "Palo Alto") -> let it be faked
                 if w in self._safe_lower and (tok[0].islower() or w not in self._names):
                     safe_char.update(range(start, end)); return
+                if tok.islower() and not _is_person and _has_eponym_partner(w, _before, _after):
+                    safe_char.update(range(start, end)); return               # "dandy walker malformation"
                 if (_PLURAL_ABBREV.match(tok) and not _is_person and w[:-1] not in self._names
                         and w[:-1] not in getattr(self, "_provider", ())):
                     safe_char.update(range(start, end)); return               # "MCAs", "MRAs", "CTs"
@@ -1532,7 +1539,7 @@ class Philter:
                     # provider name: 620 of 827 surviving provider occurrences came back this way.
                     # A bare digit is not clinical evidence -- a named clinical noun or a dose with a
                     # unit is.
-                    if w in getattr(self, "_safe_ambig_strict", ()) and (
+                    if (w in getattr(self, "_safe_ambig_strict", ()) or w in getattr(self, "_safe_ambig", ())) and (
                             _clin_after(_after) or _CTX_MED_WINDOW.search(_after)
                             or (_CTX_MED_AFTER.match(_after) and not _is_prov)):
                         safe_char.update(range(start, end)); return
@@ -1654,7 +1661,9 @@ class Philter:
                 # A roster surname in an anatomical phrase is anatomy: "circle of Willis", "vein of Galen".
                 if (_CTX_ANATOMY_BEFORE.search(txt[max(0, m.start() - 40):m.start()])
                         or _CTX_ANATOMY_AFTER.match(txt[m.end():m.end() + 28])
-                        or _has_eponym_partner(_w, txt[max(0, m.start() - 24):m.start()], txt[m.end():m.end() + 28])):
+                        or _has_eponym_partner(_w, txt[max(0, m.start() - 24):m.start()], txt[m.end():m.end() + 28])
+                        or (_w in _NUMBERED_EPONYMS and _CTX_TYPE_NUMBER.match(txt[m.end():m.end() + 28])
+                            and not _CTX_PERSON_BEFORE.search(txt[max(0, m.start() - 24):m.start()]))):
                     continue
                 # A roster surname that is ALSO curated clinical vocabulary keeps its clinical sense:
                 # "Thomas splint" is a splint even when a Dr. Thomas exists. Caught by the bench, which
