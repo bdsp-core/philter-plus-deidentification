@@ -50,6 +50,17 @@ _CTX_MED_AFTER = re.compile(
 # Personal context WINS over clinical context: a credential or honorific means it is a person.
 _CTX_PERSON_BEFORE = re.compile(
     r"\b(mr|mrs|ms|miss|dr|doctor|prof|attending|resident|rn|md|do|np|pa|by|per)\W{0,3}$", re.I)
+# Anatomy named after a person, where the eponym FOLLOWS the anatomical noun: "circle of Willis",
+# "foramen of Monro", "vein of Galen", "canal of Dorello", "foramina of Luschka and Magendie". The
+# noun list is short and specific on purpose, so "... of Smith" in ordinary prose is not affected.
+_CTX_ANATOMY_BEFORE = re.compile(
+    r"\b(circle|foramen|foramina|vein|veins|aqueduct|fissure|cistern|cave|canal|gyrus|gyri|pouch|cleft|"
+    r"loop|ganglion)\s+of\s+(?:the\s+)?(?:[A-Za-z]+\s+and\s+)?$", re.I)
+# ...and where the anatomical noun FOLLOWS the eponym but is not in _CTX_CLINICAL_AFTER:
+# "Meckel's cave", "Heschl gyrus", "Rathke cleft", "Virchow-Robin spaces", "Lewy bodies".
+_CTX_ANATOMY_AFTER = re.compile(
+    r"^(?:'s)?[\s\-]*(cave|gyrus|gyri|pouch|cleft|fissure|aqueduct|cistern|vein|veins|spaces|"
+    r"malformation|turcica|embolization|embolisation|bodies)\b", re.I)
 _CTX_PERSON_AFTER = re.compile(r"^\s*,?\s*(m\.?d|d\.?o|r\.?n|np|pa|phd|jr|sr|iii|ii|iv)\b", re.I)
 # Dose/unit context a few tokens away, for comma- or ampersand-separated medication lists
 # ("Senna, docusate 100 mg"). Adjacency-only missed these; the personal-context veto still applies.
@@ -1392,6 +1403,9 @@ class Philter:
                 if tok[0].isupper():
                     if _is_person:
                         return                                   # "Dr. Senna", "Senna, MD" -> person
+                    if (_CTX_ANATOMY_BEFORE.search(txt[max(0, start - 40):start])
+                            or _CTX_ANATOMY_AFTER.match(_after)):
+                        safe_char.update(range(start, end)); return   # "circle of Willis", "Meckel's cave"
                     if w in self._safe_lower and (_CTX_CLINICAL_AFTER.match(_after)
                                                   or _CTX_MED_AFTER.match(_after)
                                                   or _CTX_MED_WINDOW.search(_after)):
@@ -1528,6 +1542,10 @@ class Philter:
             for m in re.finditer(r"\b[A-Z][A-Za-z'\-]{2,}\b", txt):
                 _w = m.group(0).lower().strip("'-")
                 if _w not in _prov:
+                    continue
+                # A roster surname in an anatomical phrase is anatomy: "circle of Willis", "vein of Galen".
+                if (_CTX_ANATOMY_BEFORE.search(txt[max(0, m.start() - 40):m.start()])
+                        or _CTX_ANATOMY_AFTER.match(txt[m.end():m.end() + 28])):
                     continue
                 # A roster surname that is ALSO curated clinical vocabulary keeps its clinical sense:
                 # "Thomas splint" is a splint even when a Dr. Thomas exists. Caught by the bench, which
