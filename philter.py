@@ -126,7 +126,7 @@ def _near_report_word(w, index):
     return w in index or any((w[:i] + w[i + 1:]) in index for i in range(len(w)))
 # Eponyms that take a type or grade number, which must not be read as a personal suffix ("Smith II").
 _NUMBERED_EPONYMS = {"chiari", "fazekas", "fisher", "koos", "knosp", "simpson", "spetzler", "hess"}
-_CTX_TYPE_NUMBER = re.compile(r"^\s*(?:type\s+|grade\s+)?(?:[IV]{1,3}|[0-5](?:\.5)?)\b", re.I)
+_CTX_TYPE_NUMBER = re.compile(r"^\s*\(?\s*(?:type\s+|grade\s+|score\s+(?:of\s+)?)?(?:[IV]{1,3}|[0-5](?:\.5)?)\b", re.I)
 
 
 def _is_medical_compound(w, vocabs, _depth=0, strict=False):
@@ -259,6 +259,35 @@ _CTX_PERSON_VERB = re.compile(
     r"consulted|aware|present|available|reviewed)|made[ \t]+aware|reviewed|notified|called|paged|agrees|agreed|states|stated|"
     r"reports|reported|denies|denied|said|says|recommends|recommended|discussed|signed|dictated|interpreted|saw|spoke|"
     r"confirmed|acknowledged|and[ \t]+(?:I|Dr)\b)\b")
+# --- numbers that are not identifiers ------------------------------------------------------------------
+# Found by looking up every number of one to four digits in 108,000 radiology reports at the same place
+# in the output (bdsp-bind-database, deid/check_numbers.py). A changed number is a silent error.
+#
+# References to images. Reports cite the series and image on which a finding is seen: "(4/23)",
+# "(5/12, 5/14)", "series 4 image 23". The tagger reads "4/23" as a date, so the pair was shifted
+# ("(4/23)" -> "(05/23)", "(3/45)" -> "(April 2045)"), and an image number at the end of a sentence
+# was replaced by another number ("image 23." -> "image 47."). One Stanford report in nine had at
+# least one changed. The images are released with the reports, so these references matter.
+_IMAGE_WORD = re.compile(
+    r"(?i)\b(?:series|ser|se|images?|img|im|slices?|frames?)[ \t]*(?:#|no\.?|number)?[ \t]*"
+    r"(\d{1,4}(?:[ \t]*/[ \t]*\d{1,4})?(?:[ \t]*(?:,|-|\u2013|and|through|to|&)[ \t]*\d{1,4}(?:[ \t]*/[ \t]*\d{1,4})?)*)"
+    r"(?![\d/.-]\d|\d)")
+_IMAGE_PAIRS = re.compile(
+    r"\((?:[ \t]*(?:series|se)[ \t]*)?(\d{1,3})[ \t]*/[ \t]*(\d{1,4})(?:[ \t]*-[ \t]*\d{1,4})?"
+    r"(?:[ \t]*(?:[,;&]|and)[ \t]*\d{1,3}[ \t]*/[ \t]*\d{1,4}(?:[ \t]*-[ \t]*\d{1,4})?)*[ \t]*\)", re.I)
+# ...but one pair that could be a month and day, right after a word for an examination or a date, is a
+# date and is left to the date rules: "prior MRI (3/14)".
+_DATE_WORD_BEFORE = re.compile(r"(?i)\b(?:mri|mr|mra|ct|cta|pet|exam|examination|study|studies|scan|scans|prior|dated|date|"
+                               r"from|on|comparison|compared|since|until|done|performed)[ \t]*$")
+# Radiotracers: "18F-FDG" became "23F-WINOWIECKI". The isotope, and the compound if it is a known one.
+_ISOTOPE_N = r"(?:18|11|13|15|68|99m|123|124|125|131|64|89|82|201|111|177|90|223)"
+_ISOTOPE_E = r"(?:F|C|N|O|Ga|Tc|I|Cu|Zr|Rb|Tl|In|Lu|Y|Ra)"
+_RADIOTRACER = re.compile(
+    rf"(?<![\w.])(?:[\[(]?{_ISOTOPE_N}[\])]?[ \t-]?{_ISOTOPE_E}\]?|{_ISOTOPE_E}[ \t-]?{_ISOTOPE_N})(?![a-z])"
+    r"(?:[ \t-]?(?:FDG|fluorodeoxyglucose|florbetapir|florbetaben|flutemetamol|flortaucipir|PiB|PIB|FDOPA|DOPA|DOTATATE|"
+    r"DOTATOC|PSMA|choline|fluciclovine|MDP|HMPAO|ECD|sestamibi|DTPA|MIBG|ioflupane|FLT|FET|FMISO|NaF|raclopride|"
+    r"methionine|acetate|ammonia|water|tetrofosmin|pertechnetate|MAA|exametazime|bicisate|AV-?45|AV-?1451|MK-?6240|"
+    r"PBR-?28|UCB-?J)\b)?")
 # --- dates that the replacement walk takes as whole dates, before any other step sees their parts ---
 # Philter's own date rules miss some ways of writing a date, and other steps of the walk used to break
 # others before the date step was reached:
@@ -278,6 +307,7 @@ _WRITTEN_DATE = re.compile(
     rf"\b{_MON}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}\b"                 # March 4, 2019
     rf"|\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MON}\.?,?\s+\d{{4}}\b"       # 4 March 2019
     rf"|{_NB}{_DAY}-{_MON}-(?:{_YR}|\d{{2}})\b"                                  # 4-Mar-2019, 04-MAR-19
+    rf"|{_NB}{_YR}-{_MON}-{_DAY}\b"                                              # 2019-Mar-04 (I0001 report headers)
     rf"|{_NB}{_DAY}{_MON}(?:{_YR}|\d{{2}})\b"                                    # 04MAR2019, 4Mar19
     rf"|\b{_MON}\.?,?\s+(?:of\s+)?\d{{4}}\b"                                   # March 2019, March of 2019
     rf"|{_NB}{_MNUM}-{_DAY}-(?:{_YR}|\d{{2}}){_NE}"                              # 03-04-2019, 3-4-19
@@ -1783,6 +1813,20 @@ class Philter:
                                  r"mmHg|mmhg|bpm|rpm|Hz|kV|mV|nm|um|Gy|cGy|mCi|kcal|cm2|mm2|mm3|cm3)"
                                  r"s?(?![A-Za-z])", txt):
                 safe_char.update(range(m.start(), m.end()))
+            # references to images -> keep the numbers
+            for m in _IMAGE_WORD.finditer(txt):
+                safe_char.update(range(m.start(1), m.end(1)))
+            for m in _IMAGE_PAIRS.finditer(txt):
+                _one_date = (m.group(0).count("/") == 1 and "-" not in m.group(0)
+                             and 1 <= int(m.group(1)) <= 12 and 1 <= int(m.group(2)) <= 31)
+                if not (_one_date and _DATE_WORD_BEFORE.search(txt[max(0, m.start() - 14):m.start()])):
+                    safe_char.update(range(m.start(), m.end()))
+            # radiotracers ("18F-FDG", "F-18 florbetapir", "99mTc-HMPAO") -> keep
+            for m in _RADIOTRACER.finditer(txt):
+                safe_char.update(range(m.start(), m.end()))
+            # "T1weighted", written without its space -> keep
+            for m in re.finditer(r"\bT[12][ \t-]?weighted\b", txt, re.I):
+                safe_char.update(range(m.start(), m.end()))
             # a unit named after a person, after a number ("3 Tesla", "20 Gray") -> keep
             for m in _UNIT_EPONYM.finditer(txt):
                 if m.start(1) not in known_spans:
@@ -2157,13 +2201,15 @@ class Philter:
         if _SEASON_YEAR.fullmatch(s):
             return orig
         numeric_fmts = ["%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
-                        "%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%m.%d.%Y", "%m.%d.%y"]
+                        "%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%m.%d.%Y", "%m.%d.%y",
+                        "%Y-%b-%d", "%d-%b-%Y", "%d-%b-%y", "%d%b%Y", "%d%b%y"]
         for fmt in numeric_fmts:
             try:
                 d = _dt.datetime.strptime(s, fmt)
             except ValueError:
                 continue
-            return put((d + delta).strftime(fmt))
+            new = (d + delta).strftime(fmt)
+            return put(new.upper() if s.isupper() else new)
         for fmt in ("%m/%d", "%m-%d"):                  # no year: 2001 has no 29 February, 2000 has
             for year in ("2001", "2000"):
                 try:
