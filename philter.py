@@ -236,23 +236,29 @@ _CTX_CAMEL_MED = re.compile(r"^[A-Z][a-z]+[A-Z][A-Za-z0-9]*$")
 # every capitalized use became a made-up name: "Follow-up MRI is recommended" -> "Schurmann-pelfrey
 # MRI is recommended" (1,400 places), "CyberKnife" (590 places). Only entries measured to do harm are
 # listed; a rule ("every part is an ordinary word") would also drop given names such as "In-Sun".
-_ROSTER_NOT_PEOPLE = {"follow-up", "sub-acute", "neuro-oncology", "cyberknife", "intraop", "reformat", "crani", "callback"}
+_ROSTER_NOT_PEOPLE = {"follow-up", "sub-acute", "neuro-oncology", "cyberknife", "intraop", "reformat", "crani", "callback", "tesla"}
 # ...and words of the same kind that no list held, so that they are kept once they are off the roster.
-_REPORT_WORDS = {"cyberknife", "intraop", "reformat", "crani", "callback", "visualase"}
+_REPORT_WORDS = {"cyberknife", "intraop", "reformat", "crani", "callback", "visualase", "disconjugate", "isovue", "omnipaque",
+                 "visipaque", "gadavist", "multihance", "dotarem", "prohance", "magnevist", "eovist", "feraheme", "clariscan",
+                 "optiray", "ultravist"}
 # Report vocabulary that is also a rare name, put back unless the text says it is a person: "Aortic
 # Arch:", "Cerebellopontine Angles", "Rim-enhancing lesion", "Tracer: FDG", "Burr hole", "Mega cisterna
 # magna", "Moya-moya".
-_REPORT_AMBIGUOUS = {"arch", "angles", "rim", "dura", "tracer", "coma", "burr", "mega", "moya"}
+_REPORT_AMBIGUOUS = {"arch", "angles", "rim", "dura", "tracer", "coma", "burr", "mega", "moya", "tesla", "fat", "cube", "fiesta"}
 # A unit of measurement named after a person, after a number: "3 Tesla" (replaced in 9,800 places,
 # a third of the Stanford reports), "1.5-Tesla", "20 Gray in 5 fractions".
-_UNIT_EPONYM = re.compile(r"(?<![\w.])\d+(?:\.\d+)?[ \t-]{0,2}(Tesla|Gray|Hertz|Kelvin|Gauss|Curie|Becquerel|Sievert|French)\b")
+_UNIT_EPONYM = re.compile(r"(?<![\w.])\d+(?:\.\d+)?[ \t-]{0,2}((?:(?:milli|centi|micro|kilo|mega)[ \t-]?)?"
+                          r"(?:Tesla|Gray|Hertz|Kelvin|Gauss|Curie|Becquerel|Sievert|French))\b"
+                          r"|\b((?:milli|centi|micro|kilo|mega)[ \t-]?(?:Gray|Tesla|Curie|Sievert|Becquerel|Hertz))\b", re.I)
 # "Gray-white differentiation", "Gray matter", "Grey/white junction": the colour, not Dr. Gray.
-_CTX_GRAY_AFTER = re.compile(r"(?:[ \t]*[-/][ \t]*white\b|[ \t]+(?:and[ \t]+white[ \t]+)?matter\b|[ \t]*-?[ \t]*scale\b|[ \t]+zone\b)", re.I)
+_CTX_GRAY_AFTER = re.compile(r"(?:[ \t]*[-/][ \t]*white\b|[ \t]+white\b|[ \t]+(?:and[ \t]+white[ \t]+)?matter\b|[ \t]*-?[ \t]*scale\b|[ \t]+zone\b)", re.I)
 # "T2 Star weighted images".
 _CTX_T2_BEFORE = re.compile(r"\bT2[ \t*-]*$", re.I)
 # The start of a sentence, a line, a list item, or what follows a heading's colon. Not after an initial ("J. Best").
 _CTX_SENTENCE_START = re.compile(r"(?:\A[ \t]*|(?<![^A-Za-z][A-Z])[.;?!][ \t]+|:[ \t]+|\n[ \t]*(?:(?:[-*\u2022]|\d{1,2}[.)])[ \t]*)?)\Z")
 _CTX_LOWER_NEXT = re.compile(r"(?:-[a-z]+)*[ \t]+[a-z]{2,}\b")
+_CTX_LINE_START = re.compile(r"(?:\A|\n)[ \t]*\Z")
+_CTX_LABEL_COLON = re.compile(r"(?:[ \t]+[a-z]+){0,2}[ \t]*:")
 # ...unless what follows says a person is acting: "Best was notified", "Stone reviewed the images".
 _CTX_PERSON_VERB = re.compile(
     r"(?:-[a-z]+)*[ \t]+(?:(?:was|is|has|had|were|will)[ \t]+(?:been[ \t]+)?(?:notified|informed|paged|called|contacted|"
@@ -273,12 +279,14 @@ _IMAGE_WORD = re.compile(
     r"(\d{1,4}(?:[ \t]*/[ \t]*\d{1,4})?(?:[ \t]*(?:,|-|\u2013|and|through|to|&)[ \t]*\d{1,4}(?:[ \t]*/[ \t]*\d{1,4})?)*)"
     r"(?![\d/.-]\d|\d)")
 _IMAGE_PAIRS = re.compile(
-    r"\((?:[ \t]*(?:series|se)[ \t]*)?(\d{1,3})[ \t]*/[ \t]*(\d{1,4})(?:[ \t]*-[ \t]*\d{1,4})?"
-    r"(?:[ \t]*(?:[,;&]|and)[ \t]*\d{1,3}[ \t]*/[ \t]*\d{1,4}(?:[ \t]*-[ \t]*\d{1,4})?)*[ \t]*\)", re.I)
+    r"\(((?:[A-Za-z.]+,?[ \t]+){0,3})(\d{1,4})[ \t]*/[ \t]*(\d{1,4})(?:[ \t]*-[ \t]*\d{1,4})?"
+    r"(?:[ \t]*(?:[,;&]|and)[ \t]*\d{1,4}(?:[ \t]*/[ \t]*\d{1,4})?(?:[ \t]*-[ \t]*\d{1,4})?)*[ \t]*\)", re.I)
 # ...but one pair that could be a month and day, right after a word for an examination or a date, is a
-# date and is left to the date rules: "prior MRI (3/14)".
+# date and is left to the date rules: "prior MRI (3/14)", "(dated 3/14)". And a pair with a year in it
+# is a month and year, whatever stands before it: "(3/2019)", "(2019/3)".
 _DATE_WORD_BEFORE = re.compile(r"(?i)\b(?:mri|mr|mra|ct|cta|pet|exam|examination|study|studies|scan|scans|prior|dated|date|"
-                               r"from|on|comparison|compared|since|until|done|performed)[ \t]*$")
+                               r"from|on|comparison|compared|since|until|done|performed)[ \t(]*$")
+_PAIR_WITH_YEAR = re.compile(r"(?<!\d)(?:(?:0?[1-9]|1[0-2])[ \t]*/[ \t]*(?:19|20)\d{2}|(?:19|20)\d{2}[ \t]*/[ \t]*(?:0?[1-9]|1[0-2]))(?!\d)")
 # Radiotracers: "18F-FDG" became "23F-WINOWIECKI". The isotope, and the compound if it is a known one.
 _ISOTOPE_N = r"(?:18|11|13|15|68|99m|123|124|125|131|64|89|82|201|111|177|90|223)"
 _ISOTOPE_E = r"(?:F|C|N|O|Ga|Tc|I|Cu|Zr|Rb|Tl|In|Lu|Y|Ra)"
@@ -324,6 +332,10 @@ _WEEKDAY_DATE = re.compile(
     rf"|\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?(?i:{_MON})\.?,?\s+\d{{4}}\b"
     rf"|{_MNUM}/{_DAY}/(?:{_YR}|\d{{2}}){_NE}|{_MNUM}-{_DAY}-(?:{_YR}|\d{{2}}){_NE})")
 _WEEKDAY_FIRST = re.compile(rf"({_WD})(\.?,?[ \t]+)")
+# Two numeric dates joined by a hyphen: "03/04/19 - 03/09/19". The tagger takes the pair as one date,
+# and it came out as "04/17/08 - 19/03/71".
+_NUMERIC_RANGE = re.compile(
+    rf"{_NB}({_MNUM}/{_DAY}(?:/(?:{_YR}|\d{{2}}))?)([ \t]*(?:-|\u2013)[ \t]*)({_MNUM}/{_DAY}/(?:{_YR}|\d{{2}})){_NE}")
 # A range of days in one month: "March 4-6, 2019".
 _DATE_RANGE = re.compile(
     rf"\b({_MON})\.?\s+({_DAY})(?:st|nd|rd|th)?(\s*(?:-|\u2013|to|through|and|&)\s*)({_DAY})(?:st|nd|rd|th)?,?\s+({_YR})\b", re.I)
@@ -1732,8 +1744,10 @@ class Philter:
                     # replaced there ("Will reports feeling better"), which is why "Will follow up" does too.
                     if (tok.istitle() and len(w) >= 3 and w in self._safe_lower and w not in self._first
                             and w not in getattr(self, "_provider", ())
-                            and _CTX_SENTENCE_START.search(txt[max(0, start - 12):start])
-                            and _CTX_LOWER_NEXT.match(_after) and not _CTX_PERSON_VERB.match(_after)):
+                            and ((_CTX_SENTENCE_START.search(txt[max(0, start - 12):start])
+                                  and _CTX_LOWER_NEXT.match(_after) and not _CTX_PERSON_VERB.match(_after))
+                                 # ...or it is the label of a line: "Coil: 32 channel head"
+                                 or (_CTX_LINE_START.search(txt[max(0, start - 12):start]) and _CTX_LABEL_COLON.match(_after)))):
                         safe_char.update(range(start, end)); return
                     if w in self._safe_lower and (_clin_after(_after)
                                                   or _CTX_MED_AFTER.match(_after)
@@ -1815,12 +1829,16 @@ class Philter:
                 safe_char.update(range(m.start(), m.end()))
             # references to images -> keep the numbers
             for m in _IMAGE_WORD.finditer(txt):
-                safe_char.update(range(m.start(1), m.end(1)))
+                if not _PAIR_WITH_YEAR.search(m.group(1)):
+                    safe_char.update(range(m.start(1), m.end(1)))
             for m in _IMAGE_PAIRS.finditer(txt):
+                if _PAIR_WITH_YEAR.search(m.group(0)):
+                    continue
                 _one_date = (m.group(0).count("/") == 1 and "-" not in m.group(0)
-                             and 1 <= int(m.group(1)) <= 12 and 1 <= int(m.group(2)) <= 31)
-                if not (_one_date and _DATE_WORD_BEFORE.search(txt[max(0, m.start() - 14):m.start()])):
-                    safe_char.update(range(m.start(), m.end()))
+                             and 1 <= int(m.group(2)) <= 12 and 1 <= int(m.group(3)) <= 31)
+                if not (_one_date and (_DATE_WORD_BEFORE.search(txt[max(0, m.start() - 14):m.start()])
+                                       or _DATE_WORD_BEFORE.search(m.group(1)))):
+                    safe_char.update(range(m.start(2), m.end() - 1))
             # radiotracers ("18F-FDG", "F-18 florbetapir", "99mTc-HMPAO") -> keep
             for m in _RADIOTRACER.finditer(txt):
                 safe_char.update(range(m.start(), m.end()))
@@ -1829,8 +1847,12 @@ class Philter:
                 safe_char.update(range(m.start(), m.end()))
             # a unit named after a person, after a number ("3 Tesla", "20 Gray") -> keep
             for m in _UNIT_EPONYM.finditer(txt):
-                if m.start(1) not in known_spans:
-                    safe_char.update(range(m.start(1), m.end(1)))
+                _g = 1 if m.group(1) else 2
+                if m.start(_g) not in known_spans:
+                    safe_char.update(range(m.start(_g), m.end(_g)))
+            # a unit with its exponent ("0.9 cm3", "12 mm2"): the digit belongs to the unit
+            for m in re.finditer(r"(?<![A-Za-z])(?:cm|mm|m)[23](?![\dA-Za-z])", txt):
+                safe_char.update(range(m.start(), m.end()))
             # bare 1-3 digit numbers are vitals/labs/counts, never identifying -> keep (protects tables)
             for m in re.finditer(r"(?<![\w./])\d{1,3}(?![\w./])", txt):
                 safe_char.update(range(m.start(), m.end()))
@@ -1893,7 +1915,7 @@ class Philter:
         if _prov:
             _prov_med = (getattr(self, "_safe_any", set()) | getattr(self, "_safe_ambig", set())
                          | getattr(self, "_safe_ambig_strict", set()))
-            _unit_starts = {u.start(1) for u in _UNIT_EPONYM.finditer(txt)}
+            _unit_starts = {u.start(1 if u.group(1) else 2) for u in _UNIT_EPONYM.finditer(txt)}
             for m in re.finditer(r"\b[A-Z][A-Za-z'\-]{2,}\b", txt):
                 _w = m.group(0).lower().strip("'-")
                 if _w not in _prov or m.start() in _unit_starts:        # "3 Tesla" is the unit
@@ -1962,7 +1984,7 @@ class Philter:
         # WRITTEN-OUT AND UNUSUAL NUMERIC DATES (see _WRITTEN_DATE above): found here as whole dates and
         # shifted by the per-note offset, before the roster, the keep rules or the name rules see them.
         word_date_spans, _dated = {}, set()
-        for _rx in (_WEEKDAY_DATE, _DATE_RANGE, _WRITTEN_DATE, _DATE_NO_YEAR, _MONTH_ALONE, _SEASON_YEAR):
+        for _rx in (_WEEKDAY_DATE, _NUMERIC_RANGE, _DATE_RANGE, _WRITTEN_DATE, _DATE_NO_YEAR, _MONTH_ALONE, _SEASON_YEAR):
             for m in _rx.finditer(txt):
                 _g = 0 if _rx is not _MONTH_ALONE else (1 if m.group(1) else 2)
                 _a, _b = m.span(_g)
@@ -2185,6 +2207,9 @@ class Philter:
             name = when.strftime("%A")
             name = name if len(wd.group(1)) > 5 else name[:3]           # "Monday" stays long, "Mon" or "Thurs" short
             return put((name.upper() if wd.group(1).isupper() else name) + wd.group(2) + new)
+        m = _NUMERIC_RANGE.fullmatch(s)
+        if m:
+            return put(self._shift_date_str(m.group(1), shift_days) + m.group(2) + self._shift_date_str(m.group(3), shift_days))
         m = _DATE_RANGE.fullmatch(s)
         if m:
             try:
