@@ -226,6 +226,39 @@ _CTX_MED_WINDOW = re.compile(
 # Used to stop the CD (cardinal-number) SAFE filter from blessing identifiers earlier filters missed.
 _POS_LONG_DIGITS = re.compile(r"\d{7,}")
 _CTX_CAMEL_MED = re.compile(r"^[A-Z][a-z]+[A-Z][A-Za-z0-9]*$")
+# --- capitalized report words that are not names ----------------------------------------------------
+# Found by counting, place by place, the capitalized ordinary words that were replaced in 108,000
+# radiology reports (bdsp-bind-database, deid/check_capitalized_words.py). A measure that asks whether
+# MOST uses of a word are replaced cannot see these, because each is replaced in one position only.
+#
+# Entries of the provider roster that are not people. The roster is made from a provider table that
+# also lists clinics, services and machines, and the roster is consulted before anything else, so
+# every capitalized use became a made-up name: "Follow-up MRI is recommended" -> "Schurmann-pelfrey
+# MRI is recommended" (1,400 places), "CyberKnife" (590 places). Only entries measured to do harm are
+# listed; a rule ("every part is an ordinary word") would also drop given names such as "In-Sun".
+_ROSTER_NOT_PEOPLE = {"follow-up", "sub-acute", "neuro-oncology", "cyberknife", "intraop", "reformat", "crani", "callback"}
+# ...and words of the same kind that no list held, so that they are kept once they are off the roster.
+_REPORT_WORDS = {"cyberknife", "intraop", "reformat", "crani", "callback", "visualase"}
+# Report vocabulary that is also a rare name, put back unless the text says it is a person: "Aortic
+# Arch:", "Cerebellopontine Angles", "Rim-enhancing lesion", "Tracer: FDG", "Burr hole", "Mega cisterna
+# magna", "Moya-moya".
+_REPORT_AMBIGUOUS = {"arch", "angles", "rim", "dura", "tracer", "coma", "burr", "mega", "moya"}
+# A unit of measurement named after a person, after a number: "3 Tesla" (replaced in 9,800 places,
+# a third of the Stanford reports), "1.5-Tesla", "20 Gray in 5 fractions".
+_UNIT_EPONYM = re.compile(r"(?<![\w.])\d+(?:\.\d+)?[ \t-]{0,2}(Tesla|Gray|Hertz|Kelvin|Gauss|Curie|Becquerel|Sievert|French)\b")
+# "Gray-white differentiation", "Gray matter", "Grey/white junction": the colour, not Dr. Gray.
+_CTX_GRAY_AFTER = re.compile(r"(?:[ \t]*[-/][ \t]*white\b|[ \t]+(?:and[ \t]+white[ \t]+)?matter\b|[ \t]*-?[ \t]*scale\b|[ \t]+zone\b)", re.I)
+# "T2 Star weighted images".
+_CTX_T2_BEFORE = re.compile(r"\bT2[ \t*-]*$", re.I)
+# The start of a sentence, a line, a list item, or what follows a heading's colon. Not after an initial ("J. Best").
+_CTX_SENTENCE_START = re.compile(r"(?:\A[ \t]*|(?<![^A-Za-z][A-Z])[.;?!][ \t]+|:[ \t]+|\n[ \t]*(?:(?:[-*\u2022]|\d{1,2}[.)])[ \t]*)?)\Z")
+_CTX_LOWER_NEXT = re.compile(r"(?:-[a-z]+)*[ \t]+[a-z]{2,}\b")
+# ...unless what follows says a person is acting: "Best was notified", "Stone reviewed the images".
+_CTX_PERSON_VERB = re.compile(
+    r"(?:-[a-z]+)*[ \t]+(?:(?:was|is|has|had|were|will)[ \t]+(?:been[ \t]+)?(?:notified|informed|paged|called|contacted|"
+    r"consulted|aware|present|available|reviewed)|made[ \t]+aware|reviewed|notified|called|paged|agrees|agreed|states|stated|"
+    r"reports|reported|denies|denied|said|says|recommends|recommended|discussed|signed|dictated|interpreted|saw|spoke|"
+    r"confirmed|acknowledged|and[ \t]+(?:I|Dr)\b)\b")
 # --- dates that the replacement walk takes as whole dates, before any other step sees their parts ---
 # Philter's own date rules miss some ways of writing a date, and other steps of the walk used to break
 # others before the date step was reached:
@@ -1584,8 +1617,11 @@ class Philter:
             # census name set: the gate for restoring Capitalized dictionary words. A word that is
             # also a name (Vera/Yang/Rishi) stays redacted even when capitalized; a common word that
             # is NOT a name (Laboratory/Negative/Impression) is restored in any case.
-            self._names = _load("filters/blacklists/firstnames_minus_fps.json") | \
-                          _load("filters/blacklists/lastnames_minus_fps.json")
+            self._first = _load("filters/blacklists/firstnames_minus_fps.json")
+            self._names = self._first | _load("filters/blacklists/lastnames_minus_fps.json")
+            self._provider -= _ROSTER_NOT_PEOPLE
+            self._safe_lower |= _REPORT_WORDS
+            self._safe_ambig |= _REPORT_AMBIGUOUS
         safe_char = set()
         if self._safe_lower or self._safe_any:
             def _restore(tok, start, end):
@@ -1613,6 +1649,11 @@ class Philter:
                     _CTX_PERSON_AFTER.match(_after)
                     and not _CTX_ANATOMY_AFTER.match(_after)                      # "Chiari II malformation"
                     and not (w in _NUMBERED_EPONYMS and _CTX_TYPE_NUMBER.match(_after))))   # "Chiari II", "Fazekas 2"
+                # The colour gray and the T2 star sequence, by what stands next to them.
+                if tok[0].isupper() and not _is_person and (
+                        (w in ("gray", "grey") and _CTX_GRAY_AFTER.match(_after))
+                        or (w == "star" and _CTX_T2_BEFORE.search(_before))):
+                    safe_char.update(range(start, end)); return
                 # Anatomy named after a person. Checked before the place rule below, because "in Meckel's
                 # cave" and "at Wernicke's area" look like addresses to the place tagger.
                 if tok[0].isupper() and not _is_person and (
@@ -1653,6 +1694,17 @@ class Philter:
                 if tok[0].isupper():
                     if _is_person:
                         return                                   # "Dr. Senna", "Senna, MD" -> person
+                    # A common word at the start of a sentence has its capital letter from where it stands:
+                    # "Lack of flow void." (which became "Caycho of flow void"), "Near complete resolution.",
+                    # "Coil mass is stable.", "CHEST: Ports and devices: None." It is put back when it is a
+                    # dictionary word, on no first-name list and not on the roster, the next word is in lower
+                    # case, and nothing says a person is acting ("Best was notified"). First names stay
+                    # replaced there ("Will reports feeling better"), which is why "Will follow up" does too.
+                    if (tok.istitle() and len(w) >= 3 and w in self._safe_lower and w not in self._first
+                            and w not in getattr(self, "_provider", ())
+                            and _CTX_SENTENCE_START.search(txt[max(0, start - 12):start])
+                            and _CTX_LOWER_NEXT.match(_after) and not _CTX_PERSON_VERB.match(_after)):
+                        safe_char.update(range(start, end)); return
                     if w in self._safe_lower and (_clin_after(_after)
                                                   or _CTX_MED_AFTER.match(_after)
                                                   or _CTX_MED_WINDOW.search(_after)):
@@ -1731,6 +1783,10 @@ class Philter:
                                  r"mmHg|mmhg|bpm|rpm|Hz|kV|mV|nm|um|Gy|cGy|mCi|kcal|cm2|mm2|mm3|cm3)"
                                  r"s?(?![A-Za-z])", txt):
                 safe_char.update(range(m.start(), m.end()))
+            # a unit named after a person, after a number ("3 Tesla", "20 Gray") -> keep
+            for m in _UNIT_EPONYM.finditer(txt):
+                if m.start(1) not in known_spans:
+                    safe_char.update(range(m.start(1), m.end(1)))
             # bare 1-3 digit numbers are vitals/labs/counts, never identifying -> keep (protects tables)
             for m in re.finditer(r"(?<![\w./])\d{1,3}(?![\w./])", txt):
                 safe_char.update(range(m.start(), m.end()))
@@ -1793,9 +1849,10 @@ class Philter:
         if _prov:
             _prov_med = (getattr(self, "_safe_any", set()) | getattr(self, "_safe_ambig", set())
                          | getattr(self, "_safe_ambig_strict", set()))
+            _unit_starts = {u.start(1) for u in _UNIT_EPONYM.finditer(txt)}
             for m in re.finditer(r"\b[A-Z][A-Za-z'\-]{2,}\b", txt):
                 _w = m.group(0).lower().strip("'-")
-                if _w not in _prov:
+                if _w not in _prov or m.start() in _unit_starts:        # "3 Tesla" is the unit
                     continue
                 # A roster surname in an anatomical phrase is anatomy: "circle of Willis", "vein of Galen".
                 if (_CTX_ANATOMY_BEFORE.search(txt[max(0, m.start() - 40):m.start()])
