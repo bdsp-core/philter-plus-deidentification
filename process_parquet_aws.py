@@ -914,6 +914,10 @@ def main():
     parser.add_argument('--file-end', type=int, default=None, help='Index of last file (exclusive, for splitting subfolders)')
     parser.add_argument('--note-type', choices=['clinicalnotes', 'imagingreport', 'bi_clinicalnotes', 'loom'], default='clinicalnotes',
                         help='Type of notes: clinicalnotes (NoteTXT/NoteCSNID), imagingreport (ReportTXT/OrderProcedureID), or bi_clinicalnotes (TEXT/CLINICALNOTETEXTKEY)')
+    parser.add_argument('--report-rules', action='store_true',
+                        help='The notes are imaging reports: turn on the keep rules that hold only for them '
+                             '(a pair in brackets is a series and image, not a date; see Philter.report_rules). '
+                             'Implied by --note-type imagingreport')
     parser.add_argument('--surrogate', dest='surrogate', action='store_true', default=True,
                         help='Replace PHI with deterministic fakes + shifted dates (default)')
     parser.add_argument('--no-surrogate', dest='surrogate', action='store_false',
@@ -946,6 +950,8 @@ def main():
                         help='Parquet column holding the per-note (canonical per-patient) date-shift in days')
 
     args = parser.parse_args()
+    if args.report_rules or args.note_type == 'imagingreport':
+        os.environ["PHILTER_REPORT_RULES"] = "1"        # read by Philter in every worker
 
     if args.note_type == 'loom':
         id_col = 'note_id'

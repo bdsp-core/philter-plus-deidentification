@@ -430,6 +430,14 @@ class Philter:
         # `default_date_shift` applies when a file has no entry.
         self.date_shifts = {}
         self.default_date_shift = int(config.get("default_date_shift", 0))
+        # RULES FOR IMAGING REPORTS. Three keep rules rest on how radiology reports are written and are
+        # wrong for notes in general: a pair of numbers in brackets is a series and image ("(4/23)"), a
+        # dictionary word that starts a sentence is not a surname ("Lack of flow void."), and a few report
+        # words are not names ("Burr hole", "Moya-moya", "Fat Sat"). In a clinic note "(4/23)" is a date
+        # and "Moya called back" is a person. They are OFF unless the caller says the text is an imaging
+        # report: config["report_rules"], the environment variable PHILTER_REPORT_RULES=1, or
+        # process_parquet_aws.py --report-rules (implied by --note-type imagingreport).
+        self.report_rules = bool(config.get("report_rules", os.environ.get("PHILTER_REPORT_RULES", "") not in ("", "0")))
         _ds = config.get("date_shifts")
         if isinstance(_ds, dict):
             self.date_shifts = _ds
@@ -1663,7 +1671,8 @@ class Philter:
             self._names = self._first | _load("filters/blacklists/lastnames_minus_fps.json")
             self._provider -= _ROSTER_NOT_PEOPLE
             self._safe_lower |= _REPORT_WORDS
-            self._safe_ambig |= _REPORT_AMBIGUOUS
+            if self.report_rules:
+                self._safe_ambig |= _REPORT_AMBIGUOUS
         safe_char = set()
         if self._safe_lower or self._safe_any:
             def _restore(tok, start, end):
@@ -1742,7 +1751,7 @@ class Philter:
                     # dictionary word, on no first-name list and not on the roster, the next word is in lower
                     # case, and nothing says a person is acting ("Best was notified"). First names stay
                     # replaced there ("Will reports feeling better"), which is why "Will follow up" does too.
-                    if (tok.istitle() and len(w) >= 3 and w in self._safe_lower and w not in self._first
+                    if (self.report_rules and tok.istitle() and len(w) >= 3 and w in self._safe_lower and w not in self._first
                             and w not in getattr(self, "_provider", ())
                             and ((_CTX_SENTENCE_START.search(txt[max(0, start - 12):start])
                                   and _CTX_LOWER_NEXT.match(_after) and not _CTX_PERSON_VERB.match(_after))
@@ -1834,10 +1843,14 @@ class Philter:
             for m in _IMAGE_PAIRS.finditer(txt):
                 if _PAIR_WITH_YEAR.search(m.group(0)):
                     continue
-                _one_date = (m.group(0).count("/") == 1 and "-" not in m.group(0)
-                             and 1 <= int(m.group(2)) <= 12 and 1 <= int(m.group(3)) <= 31)
-                if not (_one_date and (_DATE_WORD_BEFORE.search(txt[max(0, m.start() - 14):m.start()])
-                                       or _DATE_WORD_BEFORE.search(m.group(1)))):
+                # A pair that cannot be a month and day ("(4/45)", "(1001/23)") is never a date. One that
+                # can be is a series and image only in an imaging report, and there not right after a word
+                # for an examination or a date.
+                _pairs = re.findall(r"(\d{1,4})[ \t]*/[ \t]*(\d{1,4})", m.group(0))
+                _dates = all(1 <= int(a) <= 12 and 1 <= int(b) <= 31 for a, b in _pairs)
+                _one_date = _dates and len(_pairs) == 1 and "-" not in m.group(0)
+                if not _dates or (self.report_rules and not (_one_date and (
+                        _DATE_WORD_BEFORE.search(txt[max(0, m.start() - 14):m.start()]) or _DATE_WORD_BEFORE.search(m.group(1))))):
                     safe_char.update(range(m.start(2), m.end() - 1))
             # radiotracers ("18F-FDG", "F-18 florbetapir", "99mTc-HMPAO") -> keep
             for m in _RADIOTRACER.finditer(txt):
