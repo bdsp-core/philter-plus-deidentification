@@ -157,30 +157,50 @@ _CTX_SIGNATURE_BEFORE = re.compile(
     r"(?i:\b(?:(?:radiologist|neuroradiologist|resident|fellow|technologist|physician|provider|attending|surgeon|nurse)[ \t]*:"
     r"|(?:acknowledged|interpreted|dictated|signed|read|approved|verified|finalized|transcribed|reported|entered)[ \t]+by[ \t]*:?))"
     r"[ \t]*(?:(?:D[Rr]\.?|[A-Z]\.|[A-Z][A-Za-z'\-]*),?[ \t]+){0,3}$")   # a full stop only after an initial
-# An honorific directly before the word: "Dr. Aspen", "DR. ZELBRECHT".
-_CTX_HONORIFIC_BEFORE = re.compile(r"\b(?:dr|doctor|mr|mrs|ms|miss|prof)\.?[ \t]+$", re.I)
+# An honorific directly before the word: "Dr. Aspen", "Dr Aspen", "DR. ZELBRECHT", "Mr. Zelbrecht".
+# Written in capitals, DR counts only with its full stop ("DR CHEST" is a radiograph).
+_CTX_HONORIFIC_BEFORE = re.compile(
+    r"(?:\b(?:Dr|Doctor|Mr|Mrs|Ms|Miss|Prof)\.?|\b(?:dr|doctor)\.?|\b(?:DR|DOCTOR|PROF)\.)[ \t]+$")
+# "MR" and "MS" in capitals are magnetic resonance and multiple sclerosis in a radiology report:
+# "MR BRAIN", "MS PROTOCOL", and at the end of a sentence "compared with prior MR. Findings ...".
+# So "MR." and "MS." count as honorifics only before a word that is itself in capitals and is not
+# ordinary vocabulary: "MR. ZELBRECHT WAS SEDATED" but not "PRIOR MR. FINDINGS ARE UNCHANGED".
+_CTX_HONORIFIC_CAPS_BEFORE = re.compile(r"\b(?:MR|MRS|MS|MISS)\.[ \t]+$")
 # The word starts a name that ends in a credential: "Crystal Zelbrecht, MD", "Crystal A. Zelbrecht MD".
 # Without a comma only the credentials that are not also words: "WILL DO" must not read as a name and "DO".
 _CTX_NAME_THEN_CREDENTIAL = re.compile(
-    r"^(?:[ \t]+[A-Z]\.?)?[ \t]+[A-Z][A-Za-z'\-]+"
+    r"^(?:[ \t]+[A-Z]\.?)?[ \t]+([A-Z][A-Za-z'\-]+)"
     r"(?:[ \t]*,[ \t]*(?:M\.?D|D\.?O|R\.?N|N\.?P|P\.?A|P[Hh]\.?D|MBBS|CRNA)|[ \t]+(?:MD|RN|NP|P[Hh]D|MBBS|CRNA))\b")
 # The word is itself followed by a credential, after a comma: "ZELBRECHT, MD".
 _CTX_CREDENTIAL_AFTER = re.compile(r"^[ \t]*,[ \t]*(?:M\.?D|R\.?N|N\.?P|P[Hh]\.?D|MBBS|CRNA)\b")
 
 
-def _is_named(txt, start, end, w):
-    """Strong evidence that the Capitalized word at txt[start:end] is a person's name."""
-    return w not in _SIGNATURE_NOT_NAMES and bool(
-        _CTX_SIGNATURE_BEFORE.search(txt[max(0, start - 80):start])
-        or _CTX_HONORIFIC_BEFORE.search(txt[max(0, start - 12):start])
-        or _CTX_NAME_THEN_CREDENTIAL.match(txt[end:end + 40]))
+def _is_named(txt, start, end, w, vocab=()):
+    """Strong evidence that the Capitalized word at txt[start:end] is a person's name.
+
+    `vocab` is ordinary report vocabulary, consulted where the place alone could mislead.
+    """
+    if w in _SIGNATURE_NOT_NAMES:
+        return False
+    if (_CTX_SIGNATURE_BEFORE.search(txt[max(0, start - 80):start])
+            or _CTX_HONORIFIC_BEFORE.search(txt[max(0, start - 12):start])):
+        return True
+    # "First Last, MD": the word after must not be ordinary vocabulary, or the exam title
+    # "FUNCTIONAL MRI BRAIN WITH NP TESTING" reads as a person called Brain With, NP.
+    then = _CTX_NAME_THEN_CREDENTIAL.match(txt[end:end + 40])
+    if then and then.group(1).lower() not in vocab:
+        return True
+    return bool(_CTX_HONORIFIC_CAPS_BEFORE.search(txt[max(0, start - 8):start]) and txt[start:end].isupper() and w not in vocab)
 # Words that stand where a name would in a signature line but are not names.
 _SIGNATURE_NOT_NAMES = {
     "none", "not", "no", "see", "unknown", "pending", "the", "this", "attending", "resident", "fellow", "staff",
     "radiology", "neuroradiology", "radiologist", "neuroradiologist", "technologist", "physician", "provider",
     "department", "service", "team", "imaging", "nursing", "pharmacy", "emergency", "neurology", "neurosurgery",
     "medicine", "surgery", "pediatrics", "oncology", "cardiology", "pathology", "anesthesia", "dr", "md", "rn", "np",
-    "pa", "do", "phd", "ccrn", "bsn", "msn", "crna", "rt", "mbbs"}
+    "pa", "do", "phd", "ccrn", "bsn", "msn", "crna", "rt", "mbbs",
+    # words of a role title, which stand between the cue and the name: "signed by Interpreting Nuclear Medicine Physician:"
+    "interpreting", "nuclear", "supervising", "reviewing", "reading", "referring", "ordering", "performing", "primary",
+    "chief", "senior", "junior", "signing", "dictating", "teaching", "consulting", "covering", "on", "call", "of", "and"}
 # Dose/unit context a few tokens away, for comma- or ampersand-separated medication lists
 # ("Senna, docusate 100 mg"). Adjacency-only missed these; the personal-context veto still applies.
 _CTX_MED_WINDOW = re.compile(
@@ -1505,7 +1525,7 @@ class Philter:
                     return
                 # NAMED: a Capitalized word in a signature line, right after an honorific, or at the
                 # start of a name that ends in a credential. That is a person, so no keep-list applies.
-                if tok[0].isupper() and _is_named(txt, start, end, w):
+                if tok[0].isupper() and _is_named(txt, start, end, w, self._safe_lower):
                     return
                 if w in self._safe_any:                          # curated medical term -> keep even in a place
                     safe_char.update(range(start, end)); return
@@ -1651,7 +1671,7 @@ class Philter:
             # "RADIOLOGIST: ZELBRECHT, MD". The roster cannot help for a site it does not cover.
             for m in re.finditer(r"\b[A-Z][A-Z0-9]{1,}\b", txt):
                 if m.start() not in known_spans and m.group(0).lower() not in getattr(self, "_provider", ()):
-                    if (_is_named(txt, m.start(), m.end(), m.group(0).lower())
+                    if (_is_named(txt, m.start(), m.end(), m.group(0).lower(), self._safe_lower)
                             or (m.group(0).lower() not in _SIGNATURE_NOT_NAMES
                                 and _CTX_CREDENTIAL_AFTER.match(txt[m.end():m.end() + 16]))):
                         continue
@@ -1840,7 +1860,17 @@ class Philter:
                 i = last_marker = stop; continue
             if i in name_spans and surrogate_names is not None:      # NAME -> gendered fake name
                 stop = name_spans[i]
-                contents.append(surrogate_names.fake_name_span(txt[i:stop], txt[max(0, i-6):i]))
+                # A name pattern can run on over words that are known to be safe: in a report written in
+                # capitals the salutation patterns take "ZELBRECHT AT" from "DR. ZELBRECHT AT 1430" and
+                # "QUELLORN WAS SEDATED" from "MR. QUELLORN WAS SEDATED". Replace the name only up to the
+                # first safe word and let the walk keep that word, as it already does when the safe word
+                # comes first.
+                for j in range(i + 1, stop):
+                    if j in safe_char and (j - 1) not in safe_char and not txt[j - 1].isalnum():
+                        stop = j
+                        break
+                seg = txt[i:stop]
+                contents.append(surrogate_names.fake_name_span(seg.rstrip(), txt[max(0, i-6):i]) + seg[len(seg.rstrip()):])
                 i = last_marker = stop; continue
             if i in place_spans and surrogate_places is not None:    # LOCATION/TOWN -> fake place
                 stop = place_spans[i]
