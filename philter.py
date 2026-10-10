@@ -146,6 +146,41 @@ def _is_medical_compound(w, vocabs, _depth=0, strict=False):
 
 
 _CTX_PERSON_AFTER = re.compile(r"^\s*,?\s*(m\.?d|d\.?o|r\.?n|np|pa|phd|jr|sr|iii|ii|iv)\b", re.I)
+# --- strong evidence that a Capitalized word is a person's name, whatever lists it is on ---------
+# Report signature lines: "Attending Radiologist: First M. Last, MD", "Fellow: First Last",
+# "Acknowledged by Last, RN", "Electronically signed by: Last, First A MD". The cue is followed by at
+# most three capitalized words or initials before the token, all on one line. MEASURED on 10,000
+# Stanford radiology reports: 8.6% of the places naming the report's author survived, nearly all
+# here, because a given name that is also a clinical term (the put-back list) was restored when
+# the credential sat after the SURNAME and nothing marked the given name as a person.
+_CTX_SIGNATURE_BEFORE = re.compile(
+    r"(?i:\b(?:(?:radiologist|neuroradiologist|resident|fellow|technologist|physician|provider|attending|surgeon|nurse)[ \t]*:"
+    r"|(?:acknowledged|interpreted|dictated|signed|read|approved|verified|finalized|transcribed|reported|entered)[ \t]+by[ \t]*:?))"
+    r"[ \t]*(?:(?:D[Rr]\.?|[A-Z]\.|[A-Z][A-Za-z'\-]*),?[ \t]+){0,3}$")   # a full stop only after an initial
+# An honorific directly before the word: "Dr. Aspen", "DR. ZELBRECHT".
+_CTX_HONORIFIC_BEFORE = re.compile(r"\b(?:dr|doctor|mr|mrs|ms|miss|prof)\.?[ \t]+$", re.I)
+# The word starts a name that ends in a credential: "Crystal Zelbrecht, MD", "Crystal A. Zelbrecht MD".
+# Without a comma only the credentials that are not also words: "WILL DO" must not read as a name and "DO".
+_CTX_NAME_THEN_CREDENTIAL = re.compile(
+    r"^(?:[ \t]+[A-Z]\.?)?[ \t]+[A-Z][A-Za-z'\-]+"
+    r"(?:[ \t]*,[ \t]*(?:M\.?D|D\.?O|R\.?N|N\.?P|P\.?A|P[Hh]\.?D|MBBS|CRNA)|[ \t]+(?:MD|RN|NP|P[Hh]D|MBBS|CRNA))\b")
+# The word is itself followed by a credential, after a comma: "ZELBRECHT, MD".
+_CTX_CREDENTIAL_AFTER = re.compile(r"^[ \t]*,[ \t]*(?:M\.?D|R\.?N|N\.?P|P[Hh]\.?D|MBBS|CRNA)\b")
+
+
+def _is_named(txt, start, end, w):
+    """Strong evidence that the Capitalized word at txt[start:end] is a person's name."""
+    return w not in _SIGNATURE_NOT_NAMES and bool(
+        _CTX_SIGNATURE_BEFORE.search(txt[max(0, start - 80):start])
+        or _CTX_HONORIFIC_BEFORE.search(txt[max(0, start - 12):start])
+        or _CTX_NAME_THEN_CREDENTIAL.match(txt[end:end + 40]))
+# Words that stand where a name would in a signature line but are not names.
+_SIGNATURE_NOT_NAMES = {
+    "none", "not", "no", "see", "unknown", "pending", "the", "this", "attending", "resident", "fellow", "staff",
+    "radiology", "neuroradiology", "radiologist", "neuroradiologist", "technologist", "physician", "provider",
+    "department", "service", "team", "imaging", "nursing", "pharmacy", "emergency", "neurology", "neurosurgery",
+    "medicine", "surgery", "pediatrics", "oncology", "cardiology", "pathology", "anesthesia", "dr", "md", "rn", "np",
+    "pa", "do", "phd", "ccrn", "bsn", "msn", "crna", "rt", "mbbs"}
 # Dose/unit context a few tokens away, for comma- or ampersand-separated medication lists
 # ("Senna, docusate 100 mg"). Adjacency-only missed these; the personal-context veto still applies.
 _CTX_MED_WINDOW = re.compile(
@@ -1468,6 +1503,10 @@ class Philter:
                 w = re.sub(r"[^a-z0-9]", "", tok.lower())
                 if not w:
                     return
+                # NAMED: a Capitalized word in a signature line, right after an honorific, or at the
+                # start of a name that ends in a credential. That is a person, so no keep-list applies.
+                if tok[0].isupper() and _is_named(txt, start, end, w):
+                    return
                 if w in self._safe_any:                          # curated medical term -> keep even in a place
                     safe_char.update(range(start, end)); return
                 # PERSON VETO — evaluated BEFORE any put-back, in EITHER case. Notes are full of
@@ -1607,8 +1646,15 @@ class Philter:
             # ...or a PROVIDER on the roster. A signature block ("KRYSTAL DIMAYA, RN") is all-caps, so
             # this rule was re-keeping provider names the roster filter had correctly tagged: 1,055 of
             # the 2,109 surviving provider-name occurrences on the 10k batch were all-caps.
+            # ...or stands where a person is named. In a report written in capitals a surname looks
+            # like any other word, so only its place tells: "DISCUSSED WITH DR. ZELBRECHT AT 1430",
+            # "RADIOLOGIST: ZELBRECHT, MD". The roster cannot help for a site it does not cover.
             for m in re.finditer(r"\b[A-Z][A-Z0-9]{1,}\b", txt):
                 if m.start() not in known_spans and m.group(0).lower() not in getattr(self, "_provider", ()):
+                    if (_is_named(txt, m.start(), m.end(), m.group(0).lower())
+                            or (m.group(0).lower() not in _SIGNATURE_NOT_NAMES
+                                and _CTX_CREDENTIAL_AFTER.match(txt[m.end():m.end() + 16]))):
+                        continue
                     safe_char.update(range(m.start(), m.end()))
             # stat / measurement / directional abbreviations written WITH a trailing period ("Max.",
             # "Min.", "Post.") are labels, not names -- keep them (the period disambiguates from the

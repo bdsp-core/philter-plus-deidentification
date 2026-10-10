@@ -2159,6 +2159,14 @@
         "phi_type": "NAME"
     },
     {
+        "title": "signature line",
+        "type": "regex",
+        "exclude": true,
+        "filepath": "filters/regex/salutations/signature_line.txt",
+        "note": "names after report signature cues (Radiologist:, Acknowledged by, signed by:, DR.)",
+        "phi_type": "NAME"
+    },
+    {
         "title": "u_#_patient",
         "type": "regex",
         "exclude": true,
