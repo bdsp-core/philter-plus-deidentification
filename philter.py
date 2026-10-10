@@ -226,6 +226,63 @@ _CTX_MED_WINDOW = re.compile(
 # Used to stop the CD (cardinal-number) SAFE filter from blessing identifiers earlier filters missed.
 _POS_LONG_DIGITS = re.compile(r"\d{7,}")
 _CTX_CAMEL_MED = re.compile(r"^[A-Z][a-z]+[A-Z][A-Za-z0-9]*$")
+# --- dates that the replacement walk takes as whole dates, before any other step sees their parts ---
+# Philter's own date rules miss some ways of writing a date, and other steps of the walk used to break
+# others before the date step was reached:
+#   "April 4, 2019"   the provider roster holds April and August and is consulted first, so the month
+#                     became a made-up first name and the real day stayed: "Laraine 4, 8930"
+#   "03-04-2019"      a bare one- to three-digit number is kept, and a hyphen does not stop that rule
+#                     as a slash does, so the real month and day stayed: "03-04-8930"
+#   "2019.3.4"        not recognised, left as written
+#   "March 4"         left as written in two of five places
+# Measured on 108,000 radiology reports: 7,000 dates written with April or August were damaged, and
+# about 700 real dates (complete, or month and day) were left as written.
+_MON_FULL = "January|February|March|April|May|June|July|August|September|October|November|December"
+_MON = rf"(?:{_MON_FULL}|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)"
+_DAY, _MNUM, _YR = r"(?:0?[1-9]|[12]\d|3[01])", r"(?:0?[1-9]|1[0-2])", r"(?:19|20)\d{2}"
+_NB, _NE = r"(?<![\w/.-])", r"(?![\w/-]|\.\d)"          # a number that is not part of a longer one
+_WRITTEN_DATE = re.compile(
+    rf"\b{_MON}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}\b"                 # March 4, 2019
+    rf"|\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MON}\.?,?\s+\d{{4}}\b"       # 4 March 2019
+    rf"|{_NB}{_DAY}-{_MON}-(?:{_YR}|\d{{2}})\b"                                  # 4-Mar-2019, 04-MAR-19
+    rf"|{_NB}{_DAY}{_MON}(?:{_YR}|\d{{2}})\b"                                    # 04MAR2019, 4Mar19
+    rf"|\b{_MON}\.?,?\s+(?:of\s+)?\d{{4}}\b"                                   # March 2019, March of 2019
+    rf"|{_NB}{_MNUM}-{_DAY}-(?:{_YR}|\d{{2}}){_NE}"                              # 03-04-2019, 3-4-19
+    rf"|{_NB}{_YR}([-./]){_MNUM}\1{_DAY}{_NE}"                                   # 2019-03-04, 2019.3.4
+    rf"|{_NB}{_MNUM}-{_YR}{_NE}", re.I)                                          # 03-2019
+# A weekday before a complete date. The weekday is an ordinary word and was kept, so the text read
+# "Monday, April 03, 2019": the real weekday beside the shifted date, which is both wrong and tells
+# the shift modulo seven. The pair is taken together and the weekday is set to that of the shifted
+# date. Capitalized weekdays only, so that "sat" in a sentence is never touched.
+_WD = (r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|"
+       r"SATURDAY|SUNDAY|Mon|Tues|Tue|Wed|Thurs|Thur|Thu|Fri|Sat|Sun)")
+_WEEKDAY_DATE = re.compile(
+    rf"\b{_WD}\.?,?[ \t]+(?:(?i:{_MON})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}\b"
+    rf"|\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?(?i:{_MON})\.?,?\s+\d{{4}}\b"
+    rf"|{_MNUM}/{_DAY}/(?:{_YR}|\d{{2}}){_NE}|{_MNUM}-{_DAY}-(?:{_YR}|\d{{2}}){_NE})")
+_WEEKDAY_FIRST = re.compile(rf"({_WD})(\.?,?[ \t]+)")
+# A range of days in one month: "March 4-6, 2019".
+_DATE_RANGE = re.compile(
+    rf"\b({_MON})\.?\s+({_DAY})(?:st|nd|rd|th)?(\s*(?:-|\u2013|to|through|and|&)\s*)({_DAY})(?:st|nd|rd|th)?,?\s+({_YR})\b", re.I)
+# A month and a day with no year. The month has a capital letter, and a three-letter abbreviation in
+# capitals is left alone because it is as often something else (SEP, MAR, OCT, DEC).
+_DATE_NO_YEAR = re.compile(
+    rf"\b(?:{_MON}|{_MON_FULL.upper()})\.?[ \t]+{_DAY}(?:st|nd|rd|th)?"
+    rf"(?![\w/:%-]|\.\d|[ \t]*(?:mm|cm|ml|cc|mg|min|sec|hours?|hrs?|days?|weeks?|months?|years?|x|times)\b)")
+# A month by name alone is a date where a word of time stands before it: "in March", "since August".
+# Not before a capitalized word ("by April Jones") or a hyphen ("May-Thurner"). "May" needs a stricter
+# word before it than the other months, because "and May represent" is the verb.
+_MONTH_ALONE = re.compile(
+    rf"\b(?i:in|since|until|of|from|early|late|mid|last|this|next|before|after|around|during|through|by|and|to)"
+    rf"[ \t-]+((?:{_MON_FULL.replace('May|', '')}|{_MON_FULL.upper().replace('MAY|', '')}))\b"
+    rf"(?![\w-]|\.?[ \t]*\d|[ \t]+[A-Z][a-z])"
+    rf"|\b(?i:in|since|until|of|from|early|late|mid|last|this|next|before|after|around|during|through)"
+    rf"[ \t-]+(May|MAY)\b(?![\w-]|\.?[ \t]*\d|[ \t]+[A-Z][a-z])")
+_SEASON_YEAR = re.compile(r"(?i)(?:(?:early|late|mid)[ \t-]*)?(?:spring|summer|fall|autumn|winter)(?:[ \t]+of)?[ \t]+(?:19|20)\d{2}")
+_MONTH_NUMBER = {m: n for n, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
+_W_MONTH_YEAR = re.compile(rf"({_MON})\.?,?\s+(?:of\s+)?(\d{{4}})", re.I)
+_W_MONTH_DAY = re.compile(rf"({_MON})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?", re.I)
+_W_MONTH = re.compile(rf"{_MON}\.?", re.I)
 # ---------------------------------------------------------------------------------------------
 
 
@@ -1801,18 +1858,16 @@ class Philter:
             for m in re.finditer(r"\b([A-Z]{2})\b(?=[ \t]+\d{5}(?:-\d{4})?\b)", txt):
                 if m.group(1) in _STA:
                     state_spans[m.start(1)] = m.end(1)
-        # WORD-FORM DATES ("November 25, 2024", "Nov 25 2024", "25 November 2024", "November 2024") are
-        # frequently MISSED by Philter's numeric date rules -> they would leak an unshifted real date.
-        # Detect them here and shift by the per-note offset (same as numeric dates).
-        _MON = (r"(?:January|February|March|April|May|June|July|August|September|October|November|"
-                r"December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)")
-        word_date = re.compile(
-            rf"\b{_MON}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}\b"     # Month DD, YYYY
-            rf"|\b\d{{1,2}}(?:st|nd|rd|th)?\s+{_MON}\.?,?\s+\d{{4}}\b"    # DD Month YYYY
-            rf"|\b{_MON}\.?\s+\d{{4}}\b", re.I)                          # Month YYYY
-        word_date_spans = {}
-        for m in word_date.finditer(txt):
-            word_date_spans[m.start()] = m.end()
+        # WRITTEN-OUT AND UNUSUAL NUMERIC DATES (see _WRITTEN_DATE above): found here as whole dates and
+        # shifted by the per-note offset, before the roster, the keep rules or the name rules see them.
+        word_date_spans, _dated = {}, set()
+        for _rx in (_WEEKDAY_DATE, _DATE_RANGE, _WRITTEN_DATE, _DATE_NO_YEAR, _MONTH_ALONE, _SEASON_YEAR):
+            for m in _rx.finditer(txt):
+                _g = 0 if _rx is not _MONTH_ALONE else (1 if m.group(1) else 2)
+                _a, _b = m.span(_g)
+                if _dated.isdisjoint(range(_a, _b)):
+                    word_date_spans[_a] = _b
+                    _dated.update(range(_a, _b))
         punctuation_matcher = re.compile(r"[^a-zA-Z0-9*]")
         alpha_run = re.compile(r"[A-Za-z][A-Za-z'\-]*")
         digit_run = re.compile(r"\d+")
@@ -1825,6 +1880,10 @@ class Philter:
             if i in accession_spans:                                # accession/specimen id -> fake (wins over guard)
                 stop = accession_spans[i]
                 contents.append(self._fake_accession(txt[i:stop]))
+                i = last_marker = stop; continue
+            if i in word_date_spans:                                # WRITTEN / UNUSUAL DATE -> shifted date
+                stop = word_date_spans[i]
+                contents.append(self._shift_date_str(txt[i:stop], shift_days))
                 i = last_marker = stop; continue
             if i in provider_spans and surrogate_names is not None:  # PROVIDER on the roster -> fake name
                 stop = provider_spans[i]
@@ -1850,10 +1909,6 @@ class Philter:
                 stop = state_spans[i]
                 contents.append(surrogate_places._fake_state(txt[i:stop]) or txt[i:stop])
                 i = last_marker = stop; continue
-            if i in word_date_spans:                                # WORD-FORM DATE -> shifted date
-                stop = word_date_spans[i]
-                contents.append(self._shift_date_str(txt[i:stop], shift_days))
-                i = last_marker = stop; continue
             if i in known_spans and surrogate_names is not None:    # KNOWN real name -> surrogate
                 stop = known_spans[i]
                 contents.append(surrogate_names.fake_name_span(txt[i:stop], txt[max(0, i-6):i]))
@@ -1867,12 +1922,24 @@ class Philter:
                 # ...nor a long digit run: an include range STARTING before an identifier and ending after
                 # it skips the loop past the default-deny check entirely (last_marker jumps over it),
                 # which is how the final 6 leaks on the 2,000-note sample survived.
+                # ...nor the start of a date found above.
                 nxt = min((k for k in list(known_spans) + list(longnum_spans) + list(provider_spans)
-                           if i < k < stop), default=stop)
+                           + list(word_date_spans) if i < k < stop), default=stop)
                 contents.append(txt[i:nxt]); i = last_marker = nxt; continue
             if i in date_spans:                                     # DATE -> shifted date
-                stop = date_spans[i]
-                contents.append(self._shift_date_str(txt[i:stop], shift_days))
+                stop = min([date_spans[i]] + [k for k in word_date_spans if i < k < date_spans[i]])
+                seg = txt[i:stop]
+                # "May represent artifact." The tagger reads the verb at the start of a sentence as the
+                # month, and the verb became an invented date ("June 09, 2026 represent artifact"). A
+                # month standing alone is a date only where a word of time stands before it, and those
+                # places were taken above; what arrives here is the verb, unless it is tagged a name too.
+                if (seg.strip().lower() == "may" and i not in name_spans
+                        and re.match(r"[ \t]+[a-z]", txt[stop:stop + 4])
+                        and not _CTX_PERSON_BEFORE.search(txt[max(0, i - 24):i])
+                        and not _is_named(txt, i, stop, "may")):
+                    contents.append(seg)
+                else:
+                    contents.append(self._shift_date_str(seg, shift_days))
                 i = last_marker = stop; continue
             if i in name_spans and surrogate_names is not None:      # NAME -> gendered fake name
                 stop = name_spans[i]
@@ -1882,7 +1949,7 @@ class Philter:
                 # first safe word and let the walk keep that word, as it already does when the safe word
                 # comes first.
                 for j in range(i + 1, stop):
-                    if j in safe_char and (j - 1) not in safe_char and not txt[j - 1].isalnum():
+                    if j in word_date_spans or (j in safe_char and (j - 1) not in safe_char and not txt[j - 1].isalnum()):
                         stop = j
                         break
                 seg = txt[i:stop]
@@ -1989,28 +2056,105 @@ class Philter:
         where possible. A shift of 0 is a LEGITIMATE per-patient offset (the offset is secret and drawn
         including 0): the output date is then the real date but is indistinguishable from any shifted
         one, so we emit it normally -- we do NOT asterisk it, because asterisking would MARK the shift=0
-        patients and thereby leak a clue about all their other dates. Unparseable dates fall back below."""
+        patients and thereby leak a clue about all their other dates. Unparseable dates fall back below.
+
+        The result says as much as the original and no more: a month and year stay a month and year,
+        a month and day gain no year, a month alone stays a month. Nothing depends on the day the
+        program runs. (Before, "3/2019" became "April 09, 2019" and "March 4" became "April 03, 2026",
+        with the day and the year taken from the date of the run.)"""
         import datetime as _dt
         s = orig.strip()
+        delta = _dt.timedelta(days=shift_days)
+        put = lambda new: orig.replace(s, new) if s in orig else new      # noqa: E731
+        # A weekday before the date: shift the date, then name the weekday of the shifted date in the
+        # same style ("Mon" or "Monday"). Without a year the weekday cannot be known, and is dropped.
+        wd = _WEEKDAY_FIRST.match(s)
+        if wd and len(s) > wd.end():
+            rest = s[wd.end():]
+            new = self._shift_date_str(rest, shift_days)
+            when = None
+            for fmt in ("%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y", "%B %d, %Y"):
+                try:
+                    when = _dt.datetime.strptime(new, fmt)
+                    break
+                except ValueError:
+                    continue
+            if when is None:
+                return put(new)
+            name = when.strftime("%A")
+            name = name if len(wd.group(1)) > 5 else name[:3]           # "Monday" stays long, "Mon" or "Thurs" short
+            return put((name.upper() if wd.group(1).isupper() else name) + wd.group(2) + new)
+        m = _DATE_RANGE.fullmatch(s)
+        if m:
+            try:
+                month, year = _MONTH_NUMBER[m.group(1)[:3].lower()], int(m.group(5))
+                d1 = _dt.datetime(year, month, int(m.group(2))) + delta
+                d2 = _dt.datetime(year, month, int(m.group(4))) + delta
+                if (d1.year, d1.month) == (d2.year, d2.month):
+                    return put(f"{d1:%B} {d1:%d}{m.group(3)}{d2:%d}, {d2:%Y}")
+                return put(f"{d1:%B} {d1:%d}{', ' + str(d1.year) if d1.year != d2.year else ''} to {d2:%B} {d2:%d}, {d2:%Y}")
+            except ValueError:
+                pass
+        # A season and a year is not a date: a year may stay, and a season names no month. It used to
+        # come out with the year scrambled ("spring 0449").
+        if _SEASON_YEAR.fullmatch(s):
+            return orig
         numeric_fmts = ["%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
-                        "%Y-%m-%d", "%m.%d.%Y", "%m.%d.%y", "%m/%d", "%m-%d"]
+                        "%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%m.%d.%Y", "%m.%d.%y"]
         for fmt in numeric_fmts:
             try:
                 d = _dt.datetime.strptime(s, fmt)
             except ValueError:
                 continue
-            shifted = (d + _dt.timedelta(days=shift_days)).strftime(fmt)
-            return orig.replace(s, shifted) if s in orig else shifted
-        # word dates (e.g. "March 4, 2019") via dateparser
+            return put((d + delta).strftime(fmt))
+        for fmt in ("%m/%d", "%m-%d"):                  # no year: 2001 has no 29 February, 2000 has
+            for year in ("2001", "2000"):
+                try:
+                    d = _dt.datetime.strptime(s + " " + year, fmt + " %Y")
+                except ValueError:
+                    continue
+                return put((d + delta).strftime(fmt))
+        for fmt in ("%m/%Y", "%m-%Y"):                  # month and year: shift the middle of the month
+            try:
+                d = _dt.datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+            return put((d.replace(day=15) + delta).strftime(fmt))
+        m = _W_MONTH_YEAR.fullmatch(s)                  # "March 2019", "March of 2019"
+        if m:
+            try:
+                return put((_dt.datetime(int(m.group(2)), _MONTH_NUMBER[m.group(1)[:3].lower()], 15) + delta).strftime("%B %Y"))
+            except ValueError:
+                pass
+        m = _W_MONTH_DAY.fullmatch(s)                   # "March 4", "March 4th"
+        if m:
+            for year in (2001, 2000):
+                try:
+                    d = _dt.datetime(year, _MONTH_NUMBER[m.group(1)[:3].lower()], int(m.group(2)))
+                except ValueError:
+                    continue
+                return put((d + delta).strftime("%B %d"))
+        if _W_MONTH.fullmatch(s):                       # "March"
+            return put((_dt.datetime(2001, _MONTH_NUMBER[s[:3].lower()], 15) + delta).strftime("%B"))
+        # other written dates ("March 4, 2019", "4 March 2019", "4Mar19") via dateparser. It fills in
+        # whatever a date leaves out from a base date, so parsing against two base dates shows which
+        # parts the text really states.
         try:
             import dateparser
-            d = dateparser.parse(s)
-            if d:
-                shifted = d + _dt.timedelta(days=shift_days)
-                # month-year input ("March 2020", no day) -> keep month-year granularity, don't invent a day
-                if re.fullmatch(r"[A-Za-z]{3,9}\.?\s+\d{4}", s):
-                    return shifted.strftime("%B %Y")
-                return shifted.strftime("%B %d, %Y")
+            d = dateparser.parse(s, settings={"RELATIVE_BASE": _dt.datetime(2001, 1, 15)})
+            d2 = dateparser.parse(s, settings={"RELATIVE_BASE": _dt.datetime(2004, 6, 20)}) if d else None
+            if d and d2:
+                has_y, has_m, has_d = d.year == d2.year, d.month == d2.month, d.day == d2.day
+                if has_y and has_m and has_d:
+                    return (d + delta).strftime("%B %d, %Y")
+                if has_y and has_m:
+                    return (d.replace(day=15) + delta).strftime("%B %Y")
+                if has_m and has_d:
+                    return (d + delta).strftime("%B %d")
+                if has_m:
+                    return (d.replace(day=15) + delta).strftime("%B")
+                if has_y:
+                    return orig                         # a year alone may stay
         except Exception:
             pass
         # unparseable "date" tokens are almost always ID-like (case/specimen numbers Philter mis-tagged
