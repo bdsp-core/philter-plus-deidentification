@@ -76,8 +76,7 @@ def main():
     server = "172.18.160.211,1433"
     database = "bdsp_prod"
     username = "bdsp"
-    password = "$Spikewave2022!"
-
+    password = os.environ["BDSP_SQLSERVER_PASSWORD"]  # never hard-code; set in the environment
     source_table = "bdsp_prod.Clinical.to_deIdentify_notes"
     note_id_column = "NoteCSNID"
     deid_name_column = "DeIDNoteID"
