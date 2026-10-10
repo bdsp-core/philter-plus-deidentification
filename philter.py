@@ -351,6 +351,14 @@ _RADIOTRACER = re.compile(
     r"DOTATOC|PSMA|choline|fluciclovine|MDP|HMPAO|ECD|sestamibi|DTPA|MIBG|ioflupane|FLT|FET|FMISO|NaF|raclopride|"
     r"methionine|acetate|ammonia|water|tetrofosmin|pertechnetate|MAA|exametazime|bicisate|AV-?45|AV-?1451|MK-?6240|"
     r"PBR-?28|UCB-?J)\b)?")
+# --- ages over 89 ---------------------------------------------------------------------------------------
+# HIPAA's safe-harbor list asks for ages over 89 to be given as one group, 90 or older. They were left as
+# written: "92-year-old woman", "at age 94" (111 of 113 places in 108,000 radiology reports). The number
+# becomes "90+" and the words around it stay. Not covered: the shorthand "92F", which is as often a
+# temperature.
+_AGE_OVER_89 = re.compile(
+    r"(?i)(?<![\w.])(9\d|1[0-2]\d)(?=[ \t-]?(?:years?[ \t-]?old|yrs?[ \t-]?old|y\.?o\.?(?![a-z])|y/o\b))"
+    r"|\bage[d]?[ \t:]+(?:of[ \t]+)?(9\d|1[0-2]\d)\b(?![ \t]*(?:%|mm|cm|ml|mg|months?|weeks?|days?|hours?))")
 # --- dates that the replacement walk takes as whole dates, before any other step sees their parts ---
 # Philter's own date rules miss some ways of writing a date, and other steps of the walk used to break
 # others before the date step was reached:
@@ -2073,6 +2081,11 @@ class Philter:
                 if _dated.isdisjoint(range(_a, _b)):
                     word_date_spans[_a] = _b
                     _dated.update(range(_a, _b))
+        age_spans = {}
+        for m in _AGE_OVER_89.finditer(txt):
+            _g = 1 if m.group(1) else 2
+            if _dated.isdisjoint(range(m.start(_g), m.end(_g))):
+                age_spans[m.start(_g)] = m.end(_g)
         punctuation_matcher = re.compile(r"[^a-zA-Z0-9*]")
         alpha_run = re.compile(r"[A-Za-z][A-Za-z'\-]*")
         digit_run = re.compile(r"\d+")
@@ -2090,6 +2103,9 @@ class Philter:
                 stop = word_date_spans[i]
                 contents.append(self._shift_date_str(txt[i:stop], shift_days))
                 i = last_marker = stop; continue
+            if i in age_spans:                                      # AGE OVER 89 -> "90+"
+                contents.append("90+")
+                i = last_marker = age_spans[i]; continue
             if i in provider_spans and surrogate_names is not None:  # PROVIDER on the roster -> fake name
                 stop = provider_spans[i]
                 contents.append(surrogate_names.fake_name_span(txt[i:stop], txt[max(0, i-6):i]))
@@ -2129,7 +2145,7 @@ class Philter:
                 # which is how the final 6 leaks on the 2,000-note sample survived.
                 # ...nor the start of a date found above.
                 nxt = min((k for k in list(known_spans) + list(longnum_spans) + list(provider_spans)
-                           + list(word_date_spans) if i < k < stop), default=stop)
+                           + list(word_date_spans) + list(age_spans) if i < k < stop), default=stop)
                 contents.append(txt[i:nxt]); i = last_marker = nxt; continue
             if i in date_spans:                                     # DATE -> shifted date
                 stop = min([date_spans[i]] + [k for k in word_date_spans if i < k < date_spans[i]])
