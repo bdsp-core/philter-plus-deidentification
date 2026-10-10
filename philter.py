@@ -155,7 +155,8 @@ _CTX_PERSON_AFTER = re.compile(r"^\s*,?\s*(m\.?d|d\.?o|r\.?n|np|pa|phd|jr|sr|iii
 # the credential sat after the SURNAME and nothing marked the given name as a person.
 _CTX_SIGNATURE_BEFORE = re.compile(
     r"(?i:\b(?:(?:radiologist|neuroradiologist|resident|fellow|technologist|physician|provider|attending|surgeon|nurse)[ \t]*:"
-    r"|(?:acknowledged|interpreted|dictated|signed|read|approved|verified|finalized|transcribed|reported|entered)[ \t]+by[ \t]*:?))"
+    r"|(?:acknowledged|interpreted|dictated|signed|read|approved|verified|finalized|transcribed|reported|entered)[ \t]+by[ \t]*:?"
+    r"|(?:with|to)[ \t]+provider))"
     r"[ \t]*(?:(?:D[Rr]\.?|[A-Z]\.|[A-Z][A-Za-z'\-]*),?[ \t]+){0,3}$")   # a full stop only after an initial
 # An honorific directly before the word: "Dr. Aspen", "Dr Aspen", "DR. ZELBRECHT", "Mr. Zelbrecht".
 # Written in capitals, DR counts only with its full stop ("DR CHEST" is a radiograph).
@@ -166,6 +167,14 @@ _CTX_HONORIFIC_BEFORE = re.compile(
 # So "MR." and "MS." count as honorifics only before a word that is itself in capitals and is not
 # ordinary vocabulary: "MR. ZELBRECHT WAS SEDATED" but not "PRIOR MR. FINDINGS ARE UNCHANGED".
 _CTX_HONORIFIC_CAPS_BEFORE = re.compile(r"\b(?:MR|MRS|MS|MISS)\.[ \t]+$")
+# "DISCUSSED WITH DR ZELBRECHT": DR in capitals without its full stop, when a preposition comes before it.
+_CTX_DR_AFTER_PREPOSITION = re.compile(r"\b(?:WITH|BY|TO|FROM|PER)[ \t]+DR[ \t]+$")
+# The second word of a name after a title: "Dr. Crystal [Zelbrecht]", "DR. CRYSTAL [ZELBRECHT] AT 1430".
+_CTX_TITLE_THEN_GIVEN_BEFORE = re.compile(
+    r"(?:\b(?:Dr|Doctor|DR|DOCTOR|dr|doctor)\.?)[ \t]+[A-Z][A-Za-z'\-]+[ \t]+$")
+# Short words that follow a name in a sentence written in capitals and are never part of it.
+_AFTER_A_NAME = {"at", "on", "of", "the", "and", "or", "for", "with", "by", "to", "in", "from", "re", "who", "was", "is",
+                 "has", "had", "will", "via", "per", "as", "regarding", "about", "md", "do", "rn", "np", "pa", "phd"}
 # The word starts a name that ends in a credential: "Crystal Zelbrecht, MD", "Crystal A. Zelbrecht MD".
 # Without a comma only the credentials that are not also words: "WILL DO" must not read as a name and "DO".
 _CTX_NAME_THEN_CREDENTIAL = re.compile(
@@ -183,8 +192,15 @@ def _is_named(txt, start, end, w, vocab=()):
     if w in _SIGNATURE_NOT_NAMES:
         return False
     if (_CTX_SIGNATURE_BEFORE.search(txt[max(0, start - 80):start])
-            or _CTX_HONORIFIC_BEFORE.search(txt[max(0, start - 12):start])):
+            or _CTX_HONORIFIC_BEFORE.search(txt[max(0, start - 12):start])
+            or _CTX_DR_AFTER_PREPOSITION.search(txt[max(0, start - 16):start])):
         return True
+    # The surname after "Dr. Given". The word after "Dr. Zelbrecht" is as often a verb or a service
+    # ("DR. ZELBRECHT AGREED", "Dr. Zelbrecht Stroke team"), so it counts only if it is not ordinary
+    # vocabulary. MEASURED on 10,000 MGB reports: without that test 73 more ordinary words were replaced.
+    if _CTX_TITLE_THEN_GIVEN_BEFORE.search(txt[max(0, start - 48):start]):
+        if w not in _AFTER_A_NAME and w not in vocab:
+            return True
     # "First Last, MD": the word after must not be ordinary vocabulary, or the exam title
     # "FUNCTIONAL MRI BRAIN WITH NP TESTING" reads as a person called Brain With, NP.
     then = _CTX_NAME_THEN_CREDENTIAL.match(txt[end:end + 40])
