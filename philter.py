@@ -207,6 +207,61 @@ def _is_named(txt, start, end, w, vocab=()):
     if then and then.group(1).lower() not in vocab:
         return True
     return bool(_CTX_HONORIFIC_CAPS_BEFORE.search(txt[max(0, start - 8):start]) and txt[start:end].isupper() and w not in vocab)
+# --- a given name next to a surname marks a person ---------------------------------------------------
+# The put-back list keeps a clinical word that is also a surname unless a title stands before it or a
+# credential after it. Fourteen of the 150 commonest American surnames are on that list, each for an
+# eponym or a colour: Johnson, Brown, Jones, Jackson, White, Lewis, Wright, Green, Baker, Evans, Russell,
+# Hamilton, Lilly, Stone. Written with a first name and no title they were kept: "Reviewed with John
+# Johnson" came out as "Reviewed with Aldis Johnson". Measured: 225 surnames kept this way in 10,000
+# I0001 reports and 263 before the signature-line rules. The same goes for "Johnson called back" and
+# "discussed with Jackson". The clinical sense still wins where a clinical word follows: "Stevens
+# Johnson syndrome", "Jackson Pratt drain", "White matter", "Baker cyst".
+_CTX_GIVEN_BEFORE = re.compile(r"(?<![A-Za-z])([A-Z][a-z]+|[A-Z]{2,})[ \t]+(?:[A-Z]\.?[ \t]+)?$")
+_CTX_GIVEN_AFTER = re.compile(r"[ \t]*,[ \t]*([A-Z][a-z]+|[A-Z]{2,})\b")
+_CTX_SURNAME_AFTER = re.compile(r"[ \t]+(?:[A-Z]\.?[ \t]+)?([A-Z][a-z]+|[A-Z]{2,})\b")
+_CTX_SPOKEN_WITH = re.compile(r"\b(?:discussed|reviewed|spoke|spoken|communicated|conferred|talked)[ \t]+"
+                              r"(?:by[ \t]+(?:tele)?phone[ \t]+)?with[ \t]+$", re.I)
+_NOT_A_PERSON_NOUNS = ("matter|cysts?|murmur|holes?|fat|blood|count|lesions?|mass|bodies|body|drain|tube|catheter|stool|sputum|"
+                       "discharge|zone|junction|differentiation")
+_CTX_NOT_A_PERSON_AFTER = re.compile(rf"(?:['\u2019]s)?[\s-]*(?:[A-Z][a-z']+[\s-]+)?(?:{_NOT_A_PERSON_NOUNS})\b", re.I)
+_NOT_A_PERSON_WORD = re.compile(rf"(?:{_NOT_A_PERSON_NOUNS})", re.I)
+# Given names that are as often something else in a note; they do not count as a given name here.
+_NOT_GIVEN = {"gray", "grey", "may", "will", "june", "april", "august", "jan", "star", "art", "gene", "rod", "bud", "pat", "guy",
+              "van", "dean", "major", "early", "long", "young", "white", "brown", "green", "black", "rose", "pet", "mac", "max",
+              "meg", "cam", "ray", "sam", "pam", "tim", "val", "dot", "cal"}
+
+
+def _given_name_marks_person(w, before, after, given_names, names, vocab):
+    """True if the capitalized word w, which is on a name list, stands where a person is named: after a
+    given name ("John Johnson", "Mary A. Brown"), before one after a comma ("Johnson, John"), as a given
+    name before a surname ("Laura Wright"), before a verb of a person acting ("Johnson called back"), or
+    after "discussed with". Never where a clinical word follows, and never for a word such as "matter".
+    `given_names` is a list of real given names (the NLTK names corpus), not the census first-name
+    list, which also holds White, Brown and Green."""
+    if (_clin_after(after) or _CTX_ANATOMY_AFTER.match(after) or _CTX_NOT_A_PERSON_AFTER.match(after)
+            or _NOT_A_PERSON_WORD.fullmatch(w) or (w in ("gray", "grey") and _CTX_GRAY_AFTER.match(after))
+            or _has_eponym_partner(w, before, after) or (w in _NUMBERED_EPONYMS and _CTX_TYPE_NUMBER.match(after))):
+        return False
+
+    def given(x):
+        if x.isupper() and len(x) < 4:          # in capitals a short name is as often an abbreviation: PET, MAC, MAX
+            return False
+        x = x.lower()
+        return x in given_names and x not in vocab and x not in _NOT_GIVEN
+
+    g = _CTX_GIVEN_BEFORE.search(before)
+    if g and given(g.group(1)):
+        return True
+    h = _CTX_GIVEN_AFTER.match(after)
+    if h and given(h.group(1)):
+        return True
+    if given(w):
+        n = _CTX_SURNAME_AFTER.match(after)
+        if n and n.group(1).lower() in names:
+            return True
+    return bool(_CTX_PERSON_VERB.match(after) or _CTX_SPOKEN_WITH.search(before))
+
+
 # Words that stand where a name would in a signature line but are not names.
 _SIGNATURE_NOT_NAMES = {
     "none", "not", "no", "see", "unknown", "pending", "the", "this", "attending", "resident", "fellow", "staff",
@@ -1668,6 +1723,11 @@ class Philter:
             # also a name (Vera/Yang/Rishi) stays redacted even when capitalized; a common word that
             # is NOT a name (Laboratory/Negative/Impression) is restored in any case.
             self._first = _load("filters/blacklists/firstnames_minus_fps.json")
+            try:                                     # real given names, for _given_name_marks_person
+                from nltk.corpus import names as _nltk_names
+                self._given = {x.lower() for x in _nltk_names.words()}
+            except Exception:
+                self._given = set()                  # without the corpus that evidence is simply not used
             self._names = self._first | _load("filters/blacklists/lastnames_minus_fps.json")
             self._provider -= _ROSTER_NOT_PEOPLE
             self._safe_lower |= _REPORT_WORDS
@@ -1700,6 +1760,10 @@ class Philter:
                     _CTX_PERSON_AFTER.match(_after)
                     and not _CTX_ANATOMY_AFTER.match(_after)                      # "Chiari II malformation"
                     and not (w in _NUMBERED_EPONYMS and _CTX_TYPE_NUMBER.match(_after))))   # "Chiari II", "Fazekas 2"
+                # ...and so does a given name next to it, or a verb of a person acting after it.
+                if (not _is_person and tok[0].isupper() and len(w) > 2 and w in self._names
+                        and _given_name_marks_person(w, txt[max(0, start - 40):start], _after, self._given, self._names, self._safe_lower)):
+                    _is_person = True
                 # The colour gray and the T2 star sequence, by what stands next to them.
                 if tok[0].isupper() and not _is_person and (
                         (w in ("gray", "grey") and _CTX_GRAY_AFTER.match(_after))
@@ -1882,6 +1946,11 @@ class Philter:
                     if (_is_named(txt, m.start(), m.end(), m.group(0).lower(), self._safe_lower)
                             or (m.group(0).lower() not in _SIGNATURE_NOT_NAMES
                                 and _CTX_CREDENTIAL_AFTER.match(txt[m.end():m.end() + 16]))):
+                        continue
+                    # ...or next to a given name: "MARY JOHNSON", "Thomas BELL"
+                    _lw = m.group(0).lower()
+                    if (len(_lw) > 2 and _lw in self._names and _lw not in self._safe_any and _given_name_marks_person(
+                            _lw, txt[max(0, m.start() - 40):m.start()], txt[m.end():m.end() + 28], self._given, self._names, self._safe_lower)):
                         continue
                     safe_char.update(range(m.start(), m.end()))
             # stat / measurement / directional abbreviations written WITH a trailing period ("Max.",
