@@ -18,8 +18,114 @@ def _fake_site(matched):
     return f"{place} {typ}"
 
 
+
+# ---------------------------------------------------------------------------------------------
+# Three tiers, because one flat `re.escape` + IGNORECASE list has two opposite defects at once.
+#
+# PRECISION. IGNORECASE on a short acronym replaces ordinary words with plausible hospital names,
+# and plausibly enough that no downstream reader can tell it happened:
+#     "bi-frontal atrophy"               -> "Bayside Community Hospital-frontal atrophy"
+#     "confirmed SCC of the left tonsil" -> "confirmed Kingston Hospital of the left tonsil"
+# Measured by the BIND imaging session on 108,155 identified reports: `BI` matched 69 times with
+# 60 NOT written "BI" (a bi/Bi standing alone), and `SCC` 54 times across 47 reports, 12 of which
+# also speak of a carcinoma or a semicircular canal. This is data corruption, not a privacy
+# defect -- it destroys a cancer diagnosis -- and in clinical notes both are far more frequent
+# than in imaging reports.
+#
+# RECALL. `re.escape` turns a pattern into a literal, so an entry written as a regex matches only
+# its own source text, which never occurs. "Mass General Hospital" matched NOTHING and survived
+# unredacted, as did the curly-apostrophe "Brigham and Women’s".
+#
+# Both followed from one line. The list stays the authority on WHICH names are sites; these sets
+# say only HOW each is matched.
+# ---------------------------------------------------------------------------------------------
+
+# Matched case-SENSITIVELY. Short acronyms that collide with ordinary or medical words under
+# IGNORECASE. Clinicians write these upper-case essentially always, so the recall cost is slight
+# and the precision gain is large.
+_CASE_SENSITIVE = {
+    # ONLY the entries that genuinely collide with a word or a name. Case-sensitivity costs recall
+    # -- a note writing "bidmc" in lower case would then survive -- so it is spent only where
+    # IGNORECASE actually does damage. MGH, BWH, BIDMC, NSMC and the rest are not English words and
+    # are left case-insensitive deliberately; widening this set would trade real recall for nothing.
+    "BI",        # "bi" of bi-frontal, bi-parietal, bi-hemispheric
+    "Mayo",      # "mayo" in a diet or intake note
+    "GREGoR",    # "Gregor", a person's name
+    "SCC",       # squamous cell carcinoma / semicircular canal -- also vetoed below
+    "MEE",       # middle ear effusion -- also vetoed below
+}
+
+# A site match is VETOED when one of these words appears near it, because the abbreviation has a
+# medical meaning that is far more likely in a note. SCC is squamous cell carcinoma and the
+# semicircular canal; MEE is a middle ear effusion.
+_VETO_NEAR = {
+    "SCC": ("squamous", "carcinoma", "semicircular", "canal", "cell", "tonsil", "dehiscen",
+            "cochlea", "vestibul"),
+    "MEE": ("middle ear", "effusion", "tympan", "otitis"),
+}
+_VETO_WINDOW = 60
+
+# Entries written as patterns, kept AS PATTERNS rather than escaped. Only these four, listed
+# explicitly -- un-escaping the whole 254-entry list would silently reinterpret it as regex, a
+# worse failure mode than the one being fixed.
+_REGEX_SITES = [
+    r"Brigham and Women[’']?s",
+    r"Brigham And Women'?s/Mass(achusetts)? General Health Care Center",
+    r"Mass(achusetts)? General Hospital",
+    r"Brigham and Women\s+Hospital",
+]
+
+# Dropped rather than revived, each for a reason.
+#   The four date patterns and the EPOCH pattern are dead today, and reviving them would run
+#   _fake_site over a DATE -- "5 Jan 2019" would become "Kingston Hospital". A date is not a site
+#   name, and philter2 handles dates properly as of commits 6b70248/48a313a, taking written-out and
+#   hyphenated dates whole and keeping their precision. Reviving these would be a new defect.
+#   The two pre-escaped \b forms are exact duplicates of the plain "BCH"/"CHB" entries below.
+_DROP = {
+    "EPOCH\s\d{1,2}:\s?(\d{4}|\d{1,2}/\d{1,2})\s\d{1,2}:\d{1,2}\s?to\s?(\d{2,4}|\d{1,2}/\d{1,2})\s\d{1,2}:\d{1,2}",
+    "\d{1,2}\s?(jan|feb|mar|apr|may|june|jun|july|jul|aug|sept|sep|oct|nov|dec)\.?\s+?\d{2,4}",
+    "\d{1,2}\s?(Jan|Feb|Mar|Apr|May|June|Jun|July|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\.?\s+?\d{2,4}",
+    "\d{1,2}\s?(january|february|march|april|may|june|july|august|september|october|november|december)\s+?\d{2,4}",
+    "\d{1,2}\s?(January|February|March|April|May|June|July|August|September|October|November|December)\s+?\d{2,4}",
+    "\bBCH\b",
+    "\bCHB\b",
+    "Brigham and Women\\s Hospital",
+    "Brigham and Women\u2019?s",
+    "Brigham And Women'?s/Mass(achusetts)? General Health Care Center",
+    "Mass(achusetts)? General Hospital",
+}
+
+
+def _vetoed(kw, text, start, end):
+    """True when a medical reading of this abbreviation is the likely one here."""
+    words = _VETO_NEAR.get(kw)
+    if not words:
+        return False
+    ctx = text[max(0, start - _VETO_WINDOW):end + _VETO_WINDOW].lower()
+    return any(w in ctx for w in words)
+
+
+def _build(site_list):
+    """(compiled, keyword) pairs. Short case-sensitive acronyms also refuse a match touching a
+    hyphen, which is what let \bBI\b eat the "bi" of "bi-frontal": \b treats - as a boundary."""
+    out = []
+    for kw in site_list:
+        if kw in _DROP:
+            continue
+        cs = kw in _CASE_SENSITIVE
+        flags = re.DOTALL if cs else (re.IGNORECASE | re.DOTALL)
+        if cs and len(kw) <= 4:
+            pat = rf'(?<![\w-]){re.escape(kw)}(?![\w-])'
+        else:
+            pat = rf'\b{re.escape(kw)}\b'
+        out.append((re.compile(pat, flags=flags), kw))
+    for rx in _REGEX_SITES:
+        out.append((re.compile(rx, flags=re.IGNORECASE | re.DOTALL), None))
+    return out
+
+
 def remove_keywords(text):
-    keywords = [rf'\b{re.escape(kw)}\b' for kw in [
+    _sites = [
         "EPOCH\s\d{1,2}:\s?(\d{4}|\d{1,2}/\d{1,2})\s\d{1,2}:\d{1,2}\s?to\s?(\d{2,4}|\d{1,2}/\d{1,2})\s\d{1,2}:\d{1,2}",
         "Brigham and Women’?s",
         "Brigham And Women'?s/Mass(achusetts)? General Health Care Center",
@@ -273,15 +379,17 @@ def remove_keywords(text):
         "El Camino Hospital",
         "Mount Sinai Medical Center",
         "Mayo Clinic",
-        "Cleveland Clinic"
-    ]]
+        "Cleveland Clinic",
+    ]
 
 
 
-    for keyword in keywords:
-        # Adjusted regex pattern to remove hospital names with flexibility for spaces and line breaks
-        pattern = re.compile(keyword, flags=re.IGNORECASE | re.DOTALL)
-        text = pattern.sub(lambda m: _fake_site(m.group(0)), text)   # fake site name, not "*****"
+    for pattern, kw in _build(_sites):
+        def _sub(m, kw=kw):
+            if _vetoed(kw, m.string, m.start(), m.end()):
+                return m.group(0)                                    # a medical term, left alone
+            return _fake_site(m.group(0))                            # fake site name, not "*****"
+        text = pattern.sub(_sub, text)
 
     return text
 
