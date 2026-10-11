@@ -505,8 +505,9 @@ class Philter:
         # hospitals by a code only gives them away if the notes still name them. The caller may pass a list of
         # wordings that name an institution: config["institutions_path"], the environment variable
         # PHILTER_INSTITUTIONS, or process_parquet_aws.py --institutions. It is a text file with one wording
-        # per line. Each wording is replaced in surrogate output by the fixed words "[institution]", wherever
-        # it stands as written, with any white space between its words and no letter or digit beside it.
+        # per line. Each wording is replaced in surrogate output by a FAKE institution name, the same one every
+        # time, made the way keyword_removal.py makes one for the site names it knows (hiding in plain sight),
+        # wherever it stands as written, with any white space between its words and no letter or digit beside it.
         # The list is made from the notes it is used on and stays with them: none ships with this code, and
         # the rule is OFF when no list is given.
         self.institutions = None
@@ -2213,7 +2214,8 @@ class Philter:
             i += 1
         out = "".join(contents)
         if self.institutions is not None:   # see INSTITUTION NAMES in __init__
-            out = self.institutions.sub("[institution]", out)
+            import keyword_removal
+            out = self.institutions.sub(lambda m: keyword_removal._fake_site(" ".join(m.group(0).split())), out)
         return out
 
     # -- deterministic "hiding in plain sight" surrogates for contact identifiers (phone/email/website).

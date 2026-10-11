@@ -919,8 +919,9 @@ def main():
                              '(a pair in brackets is a series and image, not a date; see Philter.report_rules). '
                              'Implied by --note-type imagingreport')
     parser.add_argument('--institutions', default=None,
-                        help='A text file with one wording per line that names an institution; each is replaced by '
-                             '"[institution]" (see Philter.institutions). The list stays with the notes; none ships with the code')
+                        help='A text file with one wording per line that names an institution; each is replaced by a '
+                             'fake institution name, the same one every time, as for the site names in keyword_removal.py '
+                             '(see Philter.institutions). The list stays with the notes; none ships with the code')
     parser.add_argument('--surrogate', dest='surrogate', action='store_true', default=True,
                         help='Replace PHI with deterministic fakes + shifted dates (default)')
     parser.add_argument('--no-surrogate', dest='surrogate', action='store_false',
