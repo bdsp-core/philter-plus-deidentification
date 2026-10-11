@@ -501,6 +501,22 @@ class Philter:
         # report: config["report_rules"], the environment variable PHILTER_REPORT_RULES=1, or
         # process_parquet_aws.py --report-rules (implied by --note-type imagingreport).
         self.report_rules = bool(config.get("report_rules", os.environ.get("PHILTER_REPORT_RULES", "") not in ("", "0")))
+        # INSTITUTION NAMES. The name of a hospital is no patient identifier, but a data set that shows its
+        # hospitals by a code only gives them away if the notes still name them. The caller may pass a list of
+        # wordings that name an institution: config["institutions_path"], the environment variable
+        # PHILTER_INSTITUTIONS, or process_parquet_aws.py --institutions. It is a text file with one wording
+        # per line. Each wording is replaced in surrogate output by the fixed words "[institution]", wherever
+        # it stands as written, with any white space between its words and no letter or digit beside it.
+        # The list is made from the notes it is used on and stays with them: none ships with this code, and
+        # the rule is OFF when no list is given.
+        self.institutions = None
+        _ip = config.get("institutions_path") or os.environ.get("PHILTER_INSTITUTIONS", "")
+        if _ip:
+            with open(_ip, encoding="utf-8") as _f:
+                _names = sorted({" ".join(line.split()) for line in _f if len(line.strip()) >= 2}, key=len, reverse=True)
+            if _names:   # longest first, so a full name is taken before an abbreviation inside it
+                self.institutions = re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(
+                    r"\s+".join(re.escape(part) for part in name.split()) for name in _names) + r")(?![A-Za-z0-9])")
         _ds = config.get("date_shifts")
         if isinstance(_ds, dict):
             self.date_shifts = _ds
@@ -2195,7 +2211,10 @@ class Philter:
             ch = txt[i]
             contents.append(ch if punctuation_matcher.match(ch) else "*")
             i += 1
-        return "".join(contents)
+        out = "".join(contents)
+        if self.institutions is not None:   # see INSTITUTION NAMES in __init__
+            out = self.institutions.sub("[institution]", out)
+        return out
 
     # -- deterministic "hiding in plain sight" surrogates for contact identifiers (phone/email/website).
     #    Same input -> same fake, keyed by SURROGATE_SALT; not reversible without the salt.
